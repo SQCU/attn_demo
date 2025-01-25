@@ -22,5 +22,9 @@ tinystories, which can be found at https://huggingface.co/datasets/roneneldan/Ti
 but it would be for the best to examine the source and comments of 'loader.py' and 'prepare.py' first, wouldn't it?
 a future commit might suggest a package of pre-binarized tinystories entries to enable a simpler and more carefree dry run.
 
-# sa,[;oming]
+# sampling:
 oh yeah you might want to be able to look at outputs from the model. haha.
+
+if you have such an inclination, you will need to edit the simplistic hardcodes in sampling.py to match your trained pgpt_lformer checkpoint.
+edit the prompt.txt default sampling cue to literally anything you feel like if you want a less tinystories oriented autoregressive decoding chain.
+sampler.py version 0.0 is more of an existence proof than a tool, if you can read this sentence you can write a better one!
