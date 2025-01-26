@@ -105,6 +105,8 @@ class DistributedDataLoader:
 # -----------------------------------------------------------------------------
 
 # downgrade to poor man's data loader:
+# maybe superfluous bc distributed data loader started working
+# delete? [ ]
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -144,6 +146,8 @@ class Hyperparameters:
     val_loss_every : int = 2000 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 5242880 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+    run_name : str = "qkrmsnorm"
+    # supercompute boilerplate
     ddp_run : bool = False #this stuff is so nyannoying
     device = "cuda" # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
     torch_compile = False   #hahahaha
@@ -189,13 +193,14 @@ if master_process:
     print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
 x, y = train_loader.next_batch()
 
-#tinystories
 if master_process:
     print("Building model...")
 
+#tinystories
 #num_vocab=50304 for non-tinystories models
+#qknorm="identitynorm" for nonqknorm models
 layer_prefab = {"dim":256,"dim_head":32,"headcount":8,"ff_mult":4, 
-"lambda":True,"layerwisenorm":"rmsnorm","qknorm":"identitynorm", "training_seqlen":args.sequence_length}
+"lambda":True,"layerwisenorm":"rmsnorm","qknorm":"rmsnorm", "training_seqlen":args.sequence_length}
 #global_prefab = {"vocab_size":8192, "num_layers":4}
 #weird errors
 global_prefab = {"vocab_size":50304, "num_layers":4}
@@ -229,7 +234,7 @@ enable_math_sdp(False)
 # modded-nanogpt optimizer inits
 adam1 = torch.optim.Adam([model.lambdaformer.what_the_embedder_doin.weight], lr=0.3,    betas=(0.9, 0.95) )
 adam2 = torch.optim.Adam([model.tokenpicker_head.weight],                    lr=0.002,  betas=(0.9, 0.95) )
-params = list(model.lambdaformer.block.parameters())
+params = list(model.lambdaformer.blocks.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2]
 adam3 = bnb.optim.Adam8bit(matrix_params, lr=0.02, betas=(0.9, 0.95) ) #tune this, sensitive
@@ -255,6 +260,10 @@ schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_ASR_env) for opt in opt
 # begin logging
 if master_process:
     run_id = str(uuid.uuid4())
+    if args.run_name is not None:
+        sep="-"
+        run_id = sep.join([args.run_name, run_id])
+    
     logdir = 'logs/%s/' % run_id
     os.makedirs(logdir, exist_ok=True)
     logfile = 'logs/%s.txt' % run_id

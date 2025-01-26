@@ -49,12 +49,12 @@ class vit22_tformer(nn.Module):
         self.dim_head = config["dim_head"]
         self.heads = config["headcount"]
         self.weighted_skipnet = config["lambda"]
-        self.layerwisenorm = getnorm(config["layerwisenorm"],shape=self.dim)
-        self.projnorm = getnorm(config["qknorm"],shape=self.dim)
         self.denseproj_mul = config["ff_mult"]
         #self.naive_causal = config["is_causal_llm"]
         #...
-
+        self.qknormalized_shape = [config["dim_head"],config["training_seqlen"],config["headcount"],config["dim_head"],]
+        self.layerwisenorm = getnorm(config["layerwisenorm"],shape=self.dim)
+        self.projnorm = getnorm(config["qknorm"],shape=self.qknormalized_shape)
 
         attn_inner_dim = self.dim_head * self.heads
         self.denseproj_inner_dim = self.dim * self.denseproj_mul
@@ -244,7 +244,7 @@ class PGPT_Lformer(nn.Module):
 
         self.lambdaformer = nn.ModuleDict(dict(
             what_the_embedder_doin = nn.Embedding(config["vocab_size"], config["dim"]),
-            block = nn.ModuleList([vit22_tformer(config) for _ in range(config["num_layers"])])
+            blocks = nn.ModuleList([vit22_tformer(config) for _ in range(config["num_layers"])])
         ))
         self.tokenpicker_head = nn.Linear(in_features=config["dim"], out_features=config["vocab_size"], bias=False)
         self.tokenpicker_head.weight.data.zero_() #re: @Grad62304977
@@ -252,7 +252,7 @@ class PGPT_Lformer(nn.Module):
     def forward(self, index, targets=None, return_logits=True):
         x = self.lambdaformer.what_the_embedder_doin(index) # get token embeddings
         x = nn.functional.rms_norm(x, (x.size(-1),)) #re: @Grad62304977
-        for decoder in self.lambdaformer.block:
+        for decoder in self.lambdaformer.blocks:
             x = decoder(x)
         x = nn.functional.rms_norm(x, (x.size(-1),)) #re: @Grad62304977
         
