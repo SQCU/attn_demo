@@ -64,8 +64,9 @@ class vit22_tformer(nn.Module):
         self.learnedlambda = nn.Parameter(torch.tensor(1.0))    #my beloved
         self.fused_swiglu_dim = self.denseproj_inner_dim*2   #this is necessary so the swiglu's two projections can be applied as a single operation.
         self.scale = self.dim_head**-0.5 #this is the 's' in 's'dpa! #exposed for cosine attention reasons!
+        self.l2normscale = None
         if config["qknorm"] == "l2norm":    #bootleg cosine attention by overloading the scale term in sdpa
-            self.scale = nn.Parameter(torch.tensor(log(config["training_seqlen"]**2-config["training_seqlen"])))
+            self.l2normscale = nn.Parameter(torch.log(torch.tensor(config["training_seqlen"]**2)-torch.tensor(config["training_seqlen"])))
 
         #...
         self.queryproj = nn.Linear(in_features=self.dim, out_features=self.dim, bias=False)
@@ -116,7 +117,10 @@ class vit22_tformer(nn.Module):
         #if we were here to explain attention instead of projections and norms,
         #we would have written this in jax or a language that compiles well!
         #instead, to benefit from flash attention 2, we want to use torch SDPA!
-        y = nn.functional.scaled_dot_product_attention(query.transpose(1,2), key.transpose(1,2), value.transpose(1,2), scale=self.scale, is_causal=True)
+        if self.l2normscale is not None:
+            y = self.l2normscale*nn.functional.scaled_dot_product_attention(query.transpose(1,2), key.transpose(1,2), value.transpose(1,2), scale=1, is_causal=True)
+        else:
+            y = nn.functional.scaled_dot_product_attention(query.transpose(1,2), key.transpose(1,2), value.transpose(1,2), scale=self.scale, is_causal=True)
 
         #reshape scalars from folded position to unfolded position so the ribosome can read the messenger headrna
         #y = self.reshape_dim_heads(self.heads, y)
@@ -167,14 +171,16 @@ def getnorm(type, shape=None):
     elif type == "dynamic_shape_layernorm":
         return dynamic_shape_layernorm()
     elif type == "l2norm":
-        return l2norm(shape) #un function
+        return l2norm() #un function
     elif type == "identitynorm":
         return identitynorm(shape)
     else:
         raise Exception("Not implemented")
 
-def l2norm(row):    #haha
-    return nn.functional.normalize(row, p=2, dim=-1)
+class l2norm(nn.Module):    #haha
+    def forward(self, inputter, **kwargs):
+        inputter = nn.functional.normalize(inputter, p=2, dim=-1)
+        return inputter
 
 def identitynorm(row):
     return nn.Identity(row)
