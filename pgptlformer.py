@@ -52,9 +52,10 @@ class vit22_tformer(nn.Module):
         self.denseproj_mul = config["ff_mult"]
         #self.naive_causal = config["is_causal_llm"]
         #...
-        self.qknormalized_shape = [config["dim_head"],config["training_seqlen"],config["headcount"],config["dim_head"],]
+        #self.qknormalized_shape = [config["dim_head"],config["training_seqlen"],config["headcount"],config["dim_head"],]
+        self.qknormalized_shape = [config["headcount"],config["dim_head"]]
         self.layerwisenorm = getnorm(config["layerwisenorm"],shape=self.dim)
-        self.projnorm = getnorm(config["qknorm"],shape=self.qknormalized_shape)
+        self.projnorm = getnorm(config["qknorm"],shape=self.qknormalized_shape)    
 
         attn_inner_dim = self.dim_head * self.heads
         self.denseproj_inner_dim = self.dim * self.denseproj_mul
@@ -161,6 +162,10 @@ def getnorm(type, shape=None):
         return nn.LayerNorm(shape, elementwise_affine=True, bias=False) #???
     elif type == "rmsnorm":
         return nn.RMSNorm(shape, elementwise_affine=False)
+    elif type == "dynamic_shape_rmsnorm":
+        return dynamic_shape_rmsnorm()
+    elif type == "dynamic_shape_layernorm":
+        return dynamic_shape_layernorm()
     elif type == "l2norm":
         return l2norm(shape) #un function
     elif type == "identitynorm":
@@ -173,6 +178,29 @@ def l2norm(row):    #haha
 
 def identitynorm(row):
     return nn.Identity(row)
+
+#from `questions/76067020/`` lol
+class dynamic_shape_rmsnorm(nn.Module):
+    def forward(self, inputter, **kwargs):
+        inputter = inputter.transpose(1,2)  #rotate!
+        #i am so sorry haha
+        #normalized_shape seems to require adjacencies, i tried a few other things first.
+        inner_shape = inputter.size()[2:]   
+
+        nn.functional.rms_norm(inputter, normalized_shape=inner_shape, **kwargs)   
+        inputter = inputter.transpose(1,2)                  #reverse rotate!
+        return inputter
+
+class dynamic_shape_layernorm(nn.Module):
+    def forward(self, inputter, **kwargs):
+        inputter = inputter.transpose(1,2)  #rotate!
+        #i am so sorry haha
+        #normalized_shape seems to require adjacencies, i tried a few other things first.
+        inner_shape = inputter.size()[2:]   
+
+        nn.functional.layer_norm(inputter, normalized_shape=inner_shape, **kwargs)   
+        inputter = inputter.transpose(1,2)                  #reverse rotate!
+        return inputter
 
 #we too are hitting that mfing noam shazeer https://arxiv.org/pdf/2002.05202 
 #if there was a self-gated ELU id want to use it instead though

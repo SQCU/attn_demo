@@ -15,7 +15,7 @@ import pgptlformer
 # ---
 init_from ='resume' 
 #out_dir = 'out'
-out_dir = os.path.join('logs','e118dbaf-93da-4b79-8ab7-ed696e2d80bc')
+out_dir = os.path.join('logs','qkrmsnorm-a283dcc5-027f-4618-8e8f-460bef6b2739')
 input_text = "FILE:prompt.txt" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 10 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
