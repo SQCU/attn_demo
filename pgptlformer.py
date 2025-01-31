@@ -60,7 +60,11 @@ class vit22_tformer(nn.Module):
         attn_inner_dim = self.dim_head * self.heads
         self.denseproj_inner_dim = self.dim * self.denseproj_mul
 
-        self.rotary = rotarizer(self.dim_head)
+        if "rotary_embedding_base" in config.keys():
+            self.rotbase = config["rotary_embedding_base"]
+        else:
+            self.rotbase = 1000 # hehe
+        self.rotary = rotarizer(self.dim_head, base=self.rotbase)
         self.learnedlambda = nn.Parameter(torch.tensor(1.0))    #my beloved
         self.fused_swiglu_dim = self.denseproj_inner_dim*2   #this is necessary so the swiglu's two projections can be applied as a single operation.
         self.scale = self.dim_head**-0.5 #this is the 's' in 's'dpa! #exposed for cosine attention reasons!
@@ -191,7 +195,8 @@ class dynamic_shape_rmsnorm(nn.Module):
         inputter = inputter.transpose(1,2)  #rotate!
         #i am so sorry haha
         #normalized_shape seems to require adjacencies, i tried a few other things first.
-        inner_shape = inputter.size()[2:]   
+        #wait the notation in the paper suggests... [3:].
+        inner_shape = inputter.size()[3:]   
 
         nn.functional.rms_norm(inputter, normalized_shape=inner_shape, **kwargs)   
         inputter = inputter.transpose(1,2)                  #reverse rotate!
@@ -202,7 +207,8 @@ class dynamic_shape_layernorm(nn.Module):
         inputter = inputter.transpose(1,2)  #rotate!
         #i am so sorry haha
         #normalized_shape seems to require adjacencies, i tried a few other things first.
-        inner_shape = inputter.size()[2:]   
+        #wait the notation in the paper suggests... [3:].
+        inner_shape = inputter.size()[3:]   
 
         nn.functional.layer_norm(inputter, normalized_shape=inner_shape, **kwargs)   
         inputter = inputter.transpose(1,2)                  #reverse rotate!

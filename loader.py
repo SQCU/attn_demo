@@ -132,8 +132,8 @@ def get_batch(split):
 @dataclass
 class Hyperparameters:
     # data hyperparams
-    input_bin : str = 'data/TinyStoriesV2-GPT4/tinystories-gpt4_train_*.bin' # input .bin to train on
-    input_val_bin : str = 'data/TinyStoriesV2-GPT4/tinystories-gpt4_val_*.bin' # input .bin to eval validation loss on
+    input_bin : str = 'data/tinystories-pqt/tinystories-pqt_train_*.bin' # input .bin to train on
+    input_val_bin : str = 'data/tinystories-pqt/tinystories-pqt_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 4*32 # macrobatch size, in sequences, across all devices
     device_batch_size : int = 32 # batch size, in sequences, per device. try to increase/decrease by powers of 2
@@ -146,7 +146,7 @@ class Hyperparameters:
     val_loss_every : int = 2000 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 5242880 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-    run_name : str = "dyn_qkl2norm"
+    run_name : str = "re-pqt-rmsXrms"
     # supercompute boilerplate
     ddp_run : bool = False #this stuff is so nyannoying
     device = "cuda" # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
@@ -200,7 +200,7 @@ if master_process:
 #num_vocab=50304 for non-tinystories models
 #qknorm="identitynorm" for nonqknorm models
 layer_prefab = {"dim":256,"dim_head":32,"headcount":8,"ff_mult":4, 
-"lambda":True,"layerwisenorm":"rmsnorm","qknorm":"l2norm", "training_seqlen":args.sequence_length}
+"lambda":True,"layerwisenorm":"rmsnorm","qknorm":"dynamic_shape_rmsnorm", "training_seqlen":args.sequence_length}
 #global_prefab = {"vocab_size":8192, "num_layers":4}
 #weird errors
 global_prefab = {"vocab_size":50304, "num_layers":4}

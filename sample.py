@@ -15,7 +15,7 @@ import pgptlformer
 # ---
 init_from ='resume' 
 #out_dir = 'out'
-out_dir = os.path.join('logs','dyn_qkrmsnorm-3824bd2b-dd4b-4737-b074-57574f2cd8fc')
+out_dir = os.path.join('logs','re-pqt-rmsXrms-2fd4a7cb-930a-464b-90e0-eef9d7551d8d')
 input_text = "FILE:prompt.txt" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 10 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
@@ -62,6 +62,8 @@ if init_from == 'resume':
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
+    total_params = sum(p.numel() for p in model.parameters())
+    print("Total parameters:", total_params)
 
 model.eval()
 model.to(device)
