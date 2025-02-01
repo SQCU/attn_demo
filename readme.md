@@ -28,3 +28,12 @@ oh yeah you might want to be able to look at outputs from the model. haha.
 if you have such an inclination, you will need to edit the simplistic hardcodes in sampling.py to match your trained pgpt_lformer checkpoint.
 edit the prompt.txt default sampling cue to literally anything you feel like if you want a less tinystories oriented autoregressive decoding chain.
 sampler.py version 0.0 is more of an existence proof than a tool, if you can read this sentence you can write a better one!
+
+# ATTENTION-II:
+[redacted]
+
+# LICENSE NOTICE: 
+all code presented *without* license :)
+do not construe the availability of this source code for authorization of any sort!
+or in fact any warranty or guarantee to the behavior, meaning, appropriate deployment, or social value of the tools demonstrated herein.
+get in touch personally if you think that code licensing is something that matters in your folkway, and we can work out something, together, which is better than what you originally had in mind. peace out~ <3
