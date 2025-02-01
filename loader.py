@@ -146,11 +146,13 @@ class Hyperparameters:
     val_loss_every : int = 2000 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 5242880 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-    run_name : str = "re-pqt-rmsXrms"
+    run_name : str = "re-pqt-rmsXrms-ATTNII"
     # supercompute boilerplate
     ddp_run : bool = False #this stuff is so nyannoying
     device = "cuda" # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
     torch_compile = False   #hahahaha
+    use_z_loss = True
+    z_loss_coefficient = 1e-4
 args = Hyperparameters()
 
 # convenience variables
@@ -200,7 +202,8 @@ if master_process:
 #num_vocab=50304 for non-tinystories models
 #qknorm="identitynorm" for nonqknorm models
 layer_prefab = {"dim":256,"dim_head":32,"headcount":8,"ff_mult":4, 
-"lambda":True,"layerwisenorm":"rmsnorm","qknorm":"dynamic_shape_rmsnorm", "training_seqlen":args.sequence_length}
+"lambda":True,"layerwisenorm":"rmsnorm","qknorm":"dynamic_shape_rmsnorm", 
+"attention_deux":True, "training_seqlen":args.sequence_length}
 #global_prefab = {"vocab_size":8192, "num_layers":4}
 #weird errors
 global_prefab = {"vocab_size":50304, "num_layers":4}
@@ -307,20 +310,25 @@ for step in range(args.num_iterations + 1):
         model.eval()
         val_loader.reset()
         val_loss = 0.0
+        val_aux_loss = 0.0
         for _ in range(val_steps):
             x_val, y_val = val_loader.next_batch()
             with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
-                _, loss = model(x_val, y_val, return_logits=False)
+                _, loss, z_loss = model(x_val, y_val, return_logits=False, return_zloss=args.use_z_loss)
                 val_loss += loss.detach()
-                del loss
+                if z_loss is not None:
+                    val_aux_loss += z_loss.detach()*args.z_loss_coefficient
+                del loss, z_loss
         if args.ddp_run:
             dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+            dist.all_reduce(val_aux_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
+        val_aux_loss /= val_steps
         # log val loss to console and to logfile
         if master_process:
-            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} val_aux_loss:{val_aux_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
             with open(logfile, "a") as f:
-                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
+                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} val_aux_loss:{val_aux_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -348,8 +356,13 @@ for step in range(args.num_iterations + 1):
     for i in range(1, train_accumulation_steps+1):
         # forward pass
         with ctx:
-            _, loss = model(x, y, return_logits=False)
+            _, loss, z_loss = model(x, y, return_logits=False, return_zloss=args.use_z_loss)
             train_loss = loss.detach()
+            if z_loss is not None:
+                train_aux_loss = z_loss.detach()*args.z_loss_coefficient
+                loss = loss+z_loss*args.z_loss_coefficient
+            else:
+                train_aux_loss = 0
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
         # backward pass
@@ -375,9 +388,9 @@ for step in range(args.num_iterations + 1):
      #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
     if master_process:
         approx_time = training_time_ms + 1000 * (time.time() - t0)
-        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} aux_loss:{train_aux_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
         with open(logfile, "a") as f:
-            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} aux_loss:{train_aux_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 

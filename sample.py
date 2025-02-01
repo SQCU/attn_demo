@@ -15,7 +15,7 @@ import pgptlformer
 # ---
 init_from ='resume' 
 #out_dir = 'out'
-out_dir = os.path.join('logs','re-pqt-rmsXrms-2fd4a7cb-930a-464b-90e0-eef9d7551d8d')
+out_dir = os.path.join('logs','re-pqt-rmsXrms-ATTNII-697f0113-bb05-480b-b6dc-42a97de0de3e')
 input_text = "FILE:prompt.txt" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 10 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
@@ -88,7 +88,7 @@ def nlm_decode(model, idx, max_new_tokens, max_seq, temperature=1.0, top_k=None)
         # if the sequence context is growing too long we must crop it at max_seq
         idx_cond = idx if idx.size(1) <= max_seq else idx[:, -max_seq:]
         #forward requesting logits not loss:
-        logits, _ = model(idx_cond, return_logits=True)
+        logits, _, _z = model(idx_cond, return_logits=True)
         # pluck the logits at the final step and scale by desired temperature
         logits = logits[:, -1, :] / temperature
         # optionally crop the logits to only the top k options

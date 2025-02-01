@@ -64,6 +64,12 @@ class vit22_tformer(nn.Module):
             self.rotbase = config["rotary_embedding_base"]
         else:
             self.rotbase = 1000 # hehe
+
+        self.attention_II = None
+        if "attention_deux" in config.keys():
+            self.attention_II = True
+
+    
         self.rotary = rotarizer(self.dim_head, base=self.rotbase)
         self.learnedlambda = nn.Parameter(torch.tensor(1.0))    #my beloved
         self.fused_swiglu_dim = self.denseproj_inner_dim*2   #this is necessary so the swiglu's two projections can be applied as a single operation.
@@ -77,6 +83,10 @@ class vit22_tformer(nn.Module):
         self.keyproj = nn.Linear(in_features=self.dim, out_features=self.dim, bias=False)
         self.valueproj = nn.Linear(in_features=self.dim, out_features=self.dim, bias=False)
         self.attnoutproj = nn.Linear(in_features=attn_inner_dim, out_features=self.dim, bias=True)
+
+        if self.attention_II:
+            self.queryBproj = nn.Linear(in_features=self.dim, out_features=self.dim, bias=False)
+            self.keyBproj = nn.Linear(in_features=self.dim, out_features=self.dim, bias=False)
 
         #dense ('mlp', 'feedforward', 'fully connected', ...) unit
         self.fused_denseproj_in = nn.Linear(in_features=self.dim, out_features=self.fused_swiglu_dim, bias=True) #this is the vit22b part
@@ -92,6 +102,11 @@ class vit22_tformer(nn.Module):
         key     = self.keyproj(x)
         value   = self.valueproj(x)
 
+        if self.attention_II:
+            biasquery   = self.queryBproj(x)
+            biaskey     = self.keyBproj(x)
+
+        
         #reshape to bundled up matmul formme
         #query   = reshape_heads_dim(self.heads, query)
         #key     = reshape_heads_dim(self.heads, key)
@@ -101,6 +116,10 @@ class vit22_tformer(nn.Module):
         key     = key.view(bat_len, seq_len, self.heads, self.dim_head)
         value   = value.view(bat_len, seq_len, self.heads, self.dim_head)
 
+        if self.attention_II:
+            biasquery   = biasquery.view(bat_len, seq_len, self.heads, self.dim_head)
+            biaskey     = biaskey.view(bat_len, seq_len, self.heads, self.dim_head)
+
         #pos_emb suggested before qknorm re: kellerjordan re: @Grad62304977
         #but we get an error for the x.ndim assertion if we run this after reshaping. whoopsie!
         cos, sin = self.rotary(query)       #our rotary unit does the shape detection from states
@@ -108,12 +127,18 @@ class vit22_tformer(nn.Module):
         #qk*norm
         query   = self.projnorm(query)
         key     = self.projnorm(key)
-        #query   = self.projnorm(query, (query.size(-1)))    #something about functional rmsnorm requiring normalized shapes.
-        #key     = self.projnorm(key, (key.size(-1)))           
+
+        if self.attention_II:
+            biasquery   = self.projnorm(biasquery)
+            biaskey     = self.projnorm(biaskey)
 
         #rotary embed after qknorm as suggested etc.
         query   = apply_rotarizer_emb(query, cos, sin)
         key     = apply_rotarizer_emb(key, cos, sin)
+
+        if self.attention_II:
+            biasquery   = apply_rotarizer_emb(biasquery, cos, sin)
+            biaskey     = apply_rotarizer_emb(biaskey, cos, sin)
 
         #laser-attn goes here
         #...
@@ -125,6 +150,15 @@ class vit22_tformer(nn.Module):
             y = self.l2normscale*nn.functional.scaled_dot_product_attention(query.transpose(1,2), key.transpose(1,2), value.transpose(1,2), scale=1, is_causal=True)
         else:
             y = nn.functional.scaled_dot_product_attention(query.transpose(1,2), key.transpose(1,2), value.transpose(1,2), scale=self.scale, is_causal=True)
+
+        if self.attention_II:
+            dud = torch.ones_like(value, dtype=query.dtype, device=query.device)
+            y_shift = scaled_dot_product_attn_bias(   #~~attempt to reuse whatever efficient kernels we have already~~ nvm
+                biasquery.transpose(1,2) , biaskey.transpose(1,2) , dud.transpose(1,2),
+                scale=self.scale, is_causal=True
+                )
+            y=y+y_shift
+
 
         #reshape scalars from folded position to unfolded position so the ribosome can read the messenger headrna
         #y = self.reshape_dim_heads(self.heads, y)
@@ -251,6 +285,38 @@ def apply_rotarizer_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1,y2], 3).type_as(x)
 
+#alternate attention to retrieve a shift matrix instead of scale matrix.
+#this will either break the first time it runs or make perfect sense whomstdve doubted it all along
+def scaled_dot_product_attn_bias(query, key, value, attn_mask=None, dropout_p=0.0,
+    is_causal=False, scale=None, enable_gqa=False):
+    #make sure you compile this or it will be slow! haha! it will be slow otherwise! haha!
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale 
+    #inversion of normal masking since we're not softmaxing
+    attn_bias = torch.ones(L, S, dtype=query.dtype, device=query.device)
+
+    if is_causal:   #sounds caus-tly to change haha heeehehee
+        assert attn_mask is None
+        temp_mask = torch.ones(L, S, dtype=torch.bool, device=query.device).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("0")) #0 not neginf
+        attn_bias.to(query.dtype)
+
+    if attn_mask is not None:   #more boilerplate ty pytorch
+        if attn_mask.dtype == torch.bool:
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("0")) #0 not neginf
+        else:
+            attn_bias *= attn_mask
+
+    if enable_gqa:  #who can say what this does
+        key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
+        value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
+
+    attn_magnitude = torch.matmul(query, key.transpose(-2, -1)) * scale
+    attn_magnitude *= attn_bias    #* to combine instead of +
+    #attn_weight = torch.softmax(attn_weight, dim=-1)   we dont want this lol
+    attn_magnitude = torch.dropout(attn_magnitude, dropout_p, train=True)
+    return attn_magnitude @ value
+
 ### states take format batch, sequence, embedding
 ### therefore 
 ### batch_size, sequence_length, embedding_dim = h_states.shape
@@ -289,7 +355,7 @@ class PGPT_Lformer(nn.Module):
         self.tokenpicker_head = nn.Linear(in_features=config["dim"], out_features=config["vocab_size"], bias=False)
         self.tokenpicker_head.weight.data.zero_() #re: @Grad62304977
 
-    def forward(self, index, targets=None, return_logits=True):
+    def forward(self, index, targets=None, return_logits=True, return_zloss=False):
         x = self.lambdaformer.what_the_embedder_doin(index) # get token embeddings
         x = nn.functional.rms_norm(x, (x.size(-1),)) #re: @Grad62304977
         for decoder in self.lambdaformer.blocks:
@@ -299,6 +365,9 @@ class PGPT_Lformer(nn.Module):
         if targets is not None:
             #grab some losses woooo
             logits  = self.tokenpicker_head(x)
+            if return_zloss: #tracking https://arxiv.org/abs/2309.14322 
+                z = torch.sum(torch.exp(logits)) #reduce: e^logit[j]
+                z_loss = torch.log(z)**2 #log and square Z. make sure to set a coefficient in trainer!
             logits  = 30 * torch.tanh(logits / 30) # @Grad62304977
             logits  = logits.float() # use tf32/fp32 for logits
             loss    = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
@@ -312,5 +381,7 @@ class PGPT_Lformer(nn.Module):
         #an appeal to performance is made:
         if not return_logits:
             logits = None
+        if not return_zloss:
+            z_loss = None
         
-        return logits, loss
+        return logits, loss, z_loss
