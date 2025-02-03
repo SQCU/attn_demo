@@ -1,0 +1,27 @@
+#identify this function in your torch dependency.
+#and change it to match this function def.
+#if you are using torch 2.5 and cannot compile NN graphs because of a mysterious file error.
+ef write_atomic(
+    path_: str,
+    content: Union[str, bytes],
+    make_dirs: bool = False,
+    encode_utf_8: bool = False,
+) -> None:
+    # Write into temporary file first to avoid conflicts between threads
+    # Avoid using a named temporary file, as those have restricted permissions
+    assert isinstance(
+        content, (str, bytes)
+    ), "Only strings and byte arrays can be saved in the cache"
+    path = Path(path_)
+    if make_dirs:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.parent / f".{os.getpid()}.{threading.get_ident()}.tmp"
+    write_mode = "w" if isinstance(content, str) else "wb"
+    with tmp_path.open(write_mode, encoding="utf-8" if encode_utf_8 else None) as f:
+        f.write(content)
+    #it takes 1loc to do this right
+    #tmp_path.rename(path)
+    tmp_path.replace(path)
+    #alternate:
+    #shutil.copy2(src=tmp_path, dst=path)
+    #os.remove(tmp_path)

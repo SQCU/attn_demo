@@ -152,13 +152,20 @@ class vit22_tformer(nn.Module):
             y = nn.functional.scaled_dot_product_attention(query.transpose(1,2), key.transpose(1,2), value.transpose(1,2), scale=self.scale, is_causal=True)
 
         if self.attention_II:
+            #REV1
             dud = torch.ones_like(value, dtype=query.dtype, device=query.device)
-            y_shift = scaled_dot_product_attn_bias(   #~~attempt to reuse whatever efficient kernels we have already~~ nvm
+            y = y + scaled_dot_product_attn_bias(   #~~attempt to reuse whatever efficient kernels we have already~~ nvm
                 biasquery.transpose(1,2) , biaskey.transpose(1,2) , dud.transpose(1,2),
                 scale=self.scale, is_causal=True
                 )
-            y=y+y_shift
-
+            """
+            #REV2
+            #attn_bias now sums the shift matrix within the attn_bias operation to our 'value' target.
+            y = scaled_dot_product_attn_bias(   #~~attempt to reuse whatever efficient kernels we have already~~ nvm
+                biasquery.transpose(1,2), biaskey.transpose(1,2), y,
+                scale=self.scale, is_causal=True
+                )
+            """
 
         #reshape scalars from folded position to unfolded position so the ribosome can read the messenger headrna
         #y = self.reshape_dim_heads(self.heads, y)
@@ -287,6 +294,8 @@ def apply_rotarizer_emb(x, cos, sin):
 
 #alternate attention to retrieve a shift matrix instead of scale matrix.
 #this will either break the first time it runs or make perfect sense whomstdve doubted it all along
+#REVISION 1:
+#"""
 def scaled_dot_product_attn_bias(query, key, value, attn_mask=None, dropout_p=0.0,
     is_causal=False, scale=None, enable_gqa=False):
     #make sure you compile this or it will be slow! haha! it will be slow otherwise! haha!
@@ -313,9 +322,67 @@ def scaled_dot_product_attn_bias(query, key, value, attn_mask=None, dropout_p=0.
 
     attn_magnitude = torch.matmul(query, key.transpose(-2, -1)) * scale
     attn_magnitude *= attn_bias    #* to combine instead of +
-    #attn_weight = torch.softmax(attn_weight, dim=-1)   we dont want this lol
+    #attn_magnitude = torch.softmax(attn_weight, dim=-1)   we dont want this lol
     attn_magnitude = torch.dropout(attn_magnitude, dropout_p, train=True)
     return attn_magnitude @ value
+#"""
+#REVISION 2: this doesn't benefit from abstract syntactic similarity to torch sdpa. so we gut it!
+#instead of creating a duds matrix of 1s to occupy the 'value' idx, we sum the shift-QK product directly
+#uncompiled this maybe uses fewer ops; profile and find out.
+"""
+def scaled_dot_product_attn_bias(query, key, value, attn_mask=None, dropout_p=0.0,
+    is_causal=False, scale=None, enable_gqa=False):
+    #make sure you compile this or it will be slow! haha! it will be slow otherwise! haha!
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale 
+    #inversion of normal masking since we're not softmaxing
+    attn_bias = torch.ones(L, S, dtype=query.dtype, device=query.device)
+
+    if is_causal:   #sounds caus-tly to change haha heeehehee
+        assert attn_mask is None
+        temp_mask = torch.ones(L, S, dtype=torch.bool, device=query.device).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("0")) #0 not neginf
+        attn_bias.to(query.dtype)
+
+    if attn_mask is not None:   #more boilerplate ty pytorch
+        if attn_mask.dtype == torch.bool:
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("0")) #0 not neginf
+        else:
+            attn_bias *= attn_mask
+
+    if enable_gqa:  #who can say what this does
+        key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
+        value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
+
+    attn_magnitude = torch.matmul(query, key.transpose(-2, -1)) * scale
+    attn_magnitude *= attn_bias    #* to combine instead of +
+    #attn_magnitude = torch.softmax(attn_weight, dim=-1)   we dont want this lol
+    attn_magnitude = torch.dropout(attn_magnitude, dropout_p, train=True)
+    #... broadcasting... if A generalmatmul B, and A has shape (N x 1), B has shape (m x p),
+    # 1 is prepended to A in torch broadcasting. then A matmul B. then prepend removed. 
+    # inplace prepend 1: a.unsqueeze_(0).
+    #
+    #attn_mag : b h n h_d ...
+    #no it *wasn't*! it's b, h, n, n!
+    #sdpa output (our v input) without transpose is
+    # b h n h_d
+    #so maybe we need to transpose sdpa_out by (-2, -1)
+    #such that sdpa_out : b h h_d n, allowing
+    #torch bmm of mat1:...{n X n} & mat2:...{h_d X n} --> bmmout: ...{h_d X n}
+    #print(attn_magnitude.size())
+    #print(value.size())
+    #attn_magnitude.unsqueeze_(0)
+    #...
+    #wow okay this is tricky. we were using a ones row reduce.
+    #basically last night we were assembling a (b h n_1 n_2) shape through biasq and biask matmul.
+    #then we multiplied it by a ones of (b h n h_d), 
+    #which reduces b h n (n) to b h n (h_d)... 
+    #where h_d rows are copies of sum(n_2) at each n index in (b h n h_d).
+    #meaning attn_II_rev1 was assigning a headwise bias along the entire sequence.
+    #which itself would be chosen by the optimizer state transformation evolution of biasq and biask.
+    return torch.add(attn_magnitude, value.transpose(-2,-1))
+"""
+
 
 ### states take format batch, sequence, embedding
 ### therefore 

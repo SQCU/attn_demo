@@ -12,10 +12,16 @@ import tiktoken
 #no gpt2s here haha
 import pgptlformer
 
+#wacky env stuff:
+#import tritonpathsetter
+#tritonpathsetter.set_cuda_paths()
+
+import pdb;
+
 # ---
 init_from ='resume' 
 #out_dir = 'out'
-out_dir = os.path.join('logs','re-pqt-rmsXrms-ATTNII-697f0113-bb05-480b-b6dc-42a97de0de3e')
+out_dir = os.path.join('logs','re-pqt-rmsXrmsx3-ATTNII_fast-af1c5037-28b9-4ce3-b351-c78046f90ee7')
 input_text = "FILE:prompt.txt" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 10 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
@@ -24,7 +30,7 @@ top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 p
 seed = 1337
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
-compile = False # use PyTorch 2.0 + triton wheels to compile the model
+torch_compile = True # use PyTorch 2.0 + triton wheels to compile the model
 maximum_context = 1024 # more tokens than this will be cropped from the decoder model's context
 
 #wizard spell to get this script's path
@@ -49,7 +55,7 @@ if init_from == 'resume':
     # init from a model saved in a specific directory
     #ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     out_dir = os.path.join(LOCAL_DIR, out_dir) #compatibility
-    ckpt_path = os.path.join(out_dir, 'state_step006250.pt')
+    ckpt_path = os.path.join(out_dir, 'state_step040500.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     if 'model_args' in checkpoint.keys():
         tformer_cfg = checkpoint['model_args']
@@ -67,7 +73,7 @@ if init_from == 'resume':
 
 model.eval()
 model.to(device)
-if compile:
+if torch_compile:
     model = torch.compile(model) # requires PyTorch 2.0 (optional)
 
 # look for the meta pickle in case it is available in the dataset folder

@@ -26,6 +26,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 import pgptlformer
 
+#wacky env stuff:
+#import tritonpathsetter
+#tritonpathsetter.set_cuda_paths()
+#tritonpathsetter.add_cuda_files()
+
 ### modded-nanogpt distributed dataset loader
 # -----------------------------------------------------------------------------
 # their simple Distributed Data Loader
@@ -135,22 +140,22 @@ class Hyperparameters:
     input_bin : str = 'data/tinystories-pqt/tinystories-pqt_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/tinystories-pqt/tinystories-pqt_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 4*32 # macrobatch size, in sequences, across all devices
-    device_batch_size : int = 32 # batch size, in sequences, per device. try to increase/decrease by powers of 2
+    batch_size : int = 4*64 # macrobatch size, in sequences, across all devices
+    device_batch_size : int = 64 # batch size, in sequences, per device. try to increase/decrease by powers of 2
     sequence_length : int = 512 # sequence length, in tokens
-    num_iterations : int = 6250 # number of iterations to run
+    num_iterations : int = 40500 # number of iterations to run #target 8 hrs
     attack : int = 40 # 2*(1-betas)^-1
     release : int = 256 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 2000 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 5242880 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-    run_name : str = "re-pqt-rmsXrms-ATTNII"
+    save_every : int = 12500 # every how many steps to save the checkpoint? 0 for only at the end
+    run_name : str = "re-pqt-rmsXrmsx3-ATTNII_fast"
     # supercompute boilerplate
     ddp_run : bool = False #this stuff is so nyannoying
     device = "cuda" # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-    torch_compile = False   #hahahaha
+    torch_compile = True   #hahahaha
     use_z_loss = True
     z_loss_coefficient = 1e-4
 args = Hyperparameters()
@@ -201,7 +206,7 @@ if master_process:
 #tinystories
 #num_vocab=50304 for non-tinystories models
 #qknorm="identitynorm" for nonqknorm models
-layer_prefab = {"dim":256,"dim_head":32,"headcount":8,"ff_mult":4, 
+layer_prefab = {"dim":768,"dim_head":64,"headcount":12,"ff_mult":4, 
 "lambda":True,"layerwisenorm":"rmsnorm","qknorm":"dynamic_shape_rmsnorm", 
 "attention_deux":True, "training_seqlen":args.sequence_length}
 #global_prefab = {"vocab_size":8192, "num_layers":4}
@@ -333,7 +338,7 @@ for step in range(args.num_iterations + 1):
         torch.cuda.synchronize()
         t0 = time.time()
 
-        if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
+        if master_process and (last_step or (args.save_every != 0 and step % args.save_every == 0)):
             # stop the clock
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.time() - t0)
