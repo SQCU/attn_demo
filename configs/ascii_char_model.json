@@ -1,0 +1,37 @@
+{
+    "input_bin": "data/tinystories-ascii/tinystories-ascii_train_*.bin",
+    "input_val_bin": "data/tinystories-ascii/tinystories-ascii_val_*.bin",
+    "run_name": "ascii-char-L8-D768",
+
+    "batch_size": 256, 
+    "device_batch_size": 64, 
+    "sequence_length": 512, 
+    "num_iterations": 13500, 
+    "attack":40,
+    "release":256,
+    "weight_decay":0,
+
+    "val_loss_every":600,
+    "val_tokens":5242880,
+    "save_every":12500,
+    "ddp_run":false,
+    "device":"cuda",
+    "torch_compile":true,
+
+    "use_z_loss": true,
+    "z_loss_coefficient": 1e-4,
+
+    "model_config": {
+        "vocab_size": 256,
+        "dim": 768,
+        "num_layers": 8,
+        "headcount": 12,
+        "dim_head": 64,
+        "ff_mult": 4,
+        "lambda": true, 
+        "layerwisenorm": "rmsnorm",
+        "qknorm": "dynamic_shape_rmsnorm",
+        "attention_deux": true,
+        "training_seqlen": 512 
+    }
+}
