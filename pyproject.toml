@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "bitsandbytes>=0.45.1",
+    "datasets>=4.0.0",
     "flash-attn==2.7.2.post1",
     "huggingface-hub>=0.28.1",
     "numpy>=2.2.2",

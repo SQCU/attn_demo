@@ -38,44 +38,44 @@ from torch.utils.data import DataLoader, TensorDataset
 ### lmao, lol, lol, lmao, etcetera.
 class vit22_tformer(nn.Module):
     def __init__(self, config):
-    super().__init__() 
-    #query_dim = config["query_dim"] #don't even think about cross_attention
-    self.dim = config["dim"])
-    self.dim_head = config["dim_head"]
-    self.heads = config["headcount"]
-    self.weighted_skipnet = config["lambda"]
-    self.layerwisenorm = getnorm(config["norm"])
-    self.projnorm = getnorm(config["qknorm"])
-    self.denseproj_mul = config["ff_mult"]
-    self.naive_causal = config["is_causal_llm"]
-    #...
+        super().__init__() 
+        #query_dim = config["query_dim"] #don't even think about cross_attention
+        self.dim = config["dim"]
+        self.dim_head = config["dim_head"]
+        self.heads = config["headcount"]
+        self.weighted_skipnet = config["lambda"]
+        self.layerwisenorm = getnorm(config["norm"])
+        self.projnorm = getnorm(config["qknorm"])
+        self.denseproj_mul = config["ff_mult"]
+        self.naive_causal = config["is_causal_llm"]
+        #...
 
-    attn_inner_dim = self.dim_head * self.heads
-    denseproj_inner_dim = dim * denseproj_mul
+        attn_inner_dim = self.dim_head * self.heads
+        denseproj_inner_dim = dim * denseproj_mul
 
-    self.learnedlambda = nn.Parameter(torch.tensor(1.0))    #my beloved
-    self.fused_swiglu_dim = self.dim*2   #this is necessary so the swiglu's two projections can be applied as a single operation.
-    self.scale = dim_head**-0.5 #this is the 's' in 's'dpa! #exposed for cosine attention reasons!
+        self.learnedlambda = nn.Parameter(torch.tensor(1.0))    #my beloved
+        self.fused_swiglu_dim = self.dim*2   #this is necessary so the swiglu's two projections can be applied as a single operation.
+        self.scale = dim_head**-0.5 #this is the 's' in 's'dpa! #exposed for cosine attention reasons!
 
-    #...
-    self.queryproj = nn.Linear(in_features=dim, out_features=dim, bias=False)
-    self.keyproj = nn.Linear(in_features=dim, out_features=dim, bias=False)
-    self.valueproj = nn.Linear(in_features=dim, out_features=dim, bias=False)
-    self.attnoutproj = nn.Linear(in_features=attn_inner_dim, out_features=dim, bias=True)
+        #...
+        self.queryproj = nn.Linear(in_features=dim, out_features=dim, bias=False)
+        self.keyproj = nn.Linear(in_features=dim, out_features=dim, bias=False)
+        self.valueproj = nn.Linear(in_features=dim, out_features=dim, bias=False)
+        self.attnoutproj = nn.Linear(in_features=attn_inner_dim, out_features=dim, bias=True)
 
-    # okay don't implement fused projections to minimize complexity of reshapes.
-    # if you do fuse all of the linear projections into a single operation, training is 15% faster btw.
+        # okay don't implement fused projections to minimize complexity of reshapes.
+        # if you do fuse all of the linear projections into a single operation, training is 15% faster btw.
 
-    #dense ('mlp', 'feedforward', 'fully connected', ...) unit
-    self.fused_denseproj_in = nn.Linear(in_features=dim, out_features=self.fused_swiglu_dim, bias=True) #this is the vit22b part
-    self.dense_swiggy = swiglu() #this is kind of superfluous but this is pedagogical programming!
-    self.denseproj_out = nn.Linear(in_features=denseproj_inner_dim, out_features=dim, bias=True)
+        #dense ('mlp', 'feedforward', 'fully connected', ...) unit
+        self.fused_denseproj_in = nn.Linear(in_features=dim, out_features=self.fused_swiglu_dim, bias=True) #this is the vit22b part
+        self.dense_swiggy = swiglu() #this is kind of superfluous but this is pedagogical programming!
+        self.denseproj_out = nn.Linear(in_features=denseproj_inner_dim, out_features=dim, bias=True)
 
-    #def skiplambdaforgreatjustice(self, x)
-    #nope. incorporate this into the forward.
+        #def skiplambdaforgreatjustice(self, x)
+        #nope. incorporate this into the forward.
 
-    #[x]
-    def self_attn(self, x, attn_bias=None)
+        #[x]
+    def self_attn(self, x, attn_bias=None):
         #norm -> {qkvproj -> qknorm{?}
         #reshape_h_d -> attn -> reshape_d_h} -> attnoutproj
         #project
@@ -183,5 +183,5 @@ def reshape_dim_heads(heads, tensor):
     # i think equivalent to traditional
     # "b h n d -> b n (h d)"
     tensor = tensor.reshape(bat_len // head_len, head_len, seq_len, emb_dim)
-    tensor = tensor.permute(0, 2, 1, 3).reshape(bat_len, // head_len, seq_len, emb_dim*head_len)
+    tensor = tensor.permute(0, 2, 1, 3).reshape(bat_len // head_len, seq_len, emb_dim*head_len)
     return tensor

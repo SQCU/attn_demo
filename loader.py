@@ -6,6 +6,8 @@
 ### set RANK 
 ### set TORCH_CUDNN_SDPA_ENABLED=1
 ### torchrun --standalone --nproc_per_node=1 loader.py
+### ...
+### uv run python loader.py --config_file configs/ascii_char_model.json
 import os
 import sys
 with open(sys.argv[0]) as f:
@@ -13,7 +15,9 @@ with open(sys.argv[0]) as f:
 import uuid
 import glob
 import time
-from dataclasses import dataclass
+import json
+import argparse
+from dataclasses import dataclass, field, asdict
 
 import numpy as np
 import torch
@@ -21,15 +25,10 @@ import bitsandbytes as bnb
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
-import torch._inductor.config as config
+import torch._inductor.config as tconfig #... as tconfig? what on earth was that? oh okay.
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 import pgptlformer
-
-#wacky env stuff:
-#import tritonpathsetter
-#tritonpathsetter.set_cuda_paths()
-#tritonpathsetter.add_cuda_files()
 
 ### modded-nanogpt distributed dataset loader
 # -----------------------------------------------------------------------------
@@ -108,7 +107,6 @@ class DistributedDataLoader:
         return x.cuda(), y.cuda()
 
 # -----------------------------------------------------------------------------
-
 # downgrade to poor man's data loader:
 # maybe superfluous bc distributed data loader started working
 # delete? [ ]
@@ -134,31 +132,78 @@ def get_batch(split):
 ### modded-nanogpt
 ### either 24/16*20=30 batches per 4090 or 24/32*20=15 batches per 4090, 
 ### depending on what kind of v100 tinystories used. 
+### stuff these w/:
+### uv run loader.py --config_file configs/ascii_char_model.json
 @dataclass
 class Hyperparameters:
     # data hyperparams
     input_bin : str = 'data/tinystories-pqt/tinystories-pqt_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/tinystories-pqt/tinystories-pqt_val_*.bin' # input .bin to eval validation loss on
+    run_name : str = "re-pqt-rmsXrmsx3-ATTNII_fast"
     # optimization hyperparams
     batch_size : int = 4*64 # macrobatch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device. try to increase/decrease by powers of 2
     sequence_length : int = 512 # sequence length, in tokens
-    num_iterations : int = 40500 # number of iterations to run #target 8 hrs
+    num_iterations : int = 4500 # number of iterations to run #target 8 hrs
     attack : int = 40 # 2*(1-betas)^-1
     release : int = 256 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
-    val_loss_every : int = 2000 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every : int = 200 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 5242880 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 12500 # every how many steps to save the checkpoint? 0 for only at the end
-    run_name : str = "re-pqt-rmsXrmsx3-ATTNII_fast"
     # supercompute boilerplate
     ddp_run : bool = False #this stuff is so nyannoying
     device = "cuda" # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
     torch_compile = True   #hahahaha
     use_z_loss = True
     z_loss_coefficient = 1e-4
-args = Hyperparameters()
+    # model arch boilerplate
+    model_config: dict = field(default_factory=lambda: {
+        #global hparams
+        "vocab_size": 50304,    #magic number wrt one specific tokenizer
+        "num_layers": 4,
+        #layer hparams
+        "dim": 768,
+        "dim_head": 64,
+        "headcount": 12,
+        "ff_mult": 4,
+        "lambda": True, # The key 'lambda' is perfectly fine in a dictionary
+        "layerwisenorm": "rmsnorm",
+        "qknorm": "dynamic_shape_rmsnorm",
+        "attention_deux": True,
+        "training_seqlen": 512 # This was hardcoded before, good to have it here
+    })
+
+# --- REVISED: Simplified config loading logic ---
+def load_config():
+    parser = argparse.ArgumentParser(description="Train a PGPT-Lformer model.")
+    parser.add_argument("--config_file", type=str, default="", help="Path to a JSON configuration file.")
+    cli_args, _ = parser.parse_known_args()
+
+    args = Hyperparameters()
+
+    config_path = cli_args.config_file or args.config_file
+    if config_path:
+        print(f"Loading configuration from: {config_path}")
+        with open(config_path) as f:
+            config_data = json.load(f)
+        
+        # Update both top-level hyperparameters and the nested model_config dictionary
+        for key, value in config_data.items():
+            if key in args.model_config:
+                args.model_config[key] = value
+            elif hasattr(args, key):
+                setattr(args, key, value)
+            else:
+                print(f"WARNING: Unknown hyperparameter '{key}' in config file.")
+    
+    # Ensure sequence_length is consistent between training params and model params
+    args.model_config['training_seqlen'] = args.sequence_length
+            
+    return args
+
+args = load_config()
 
 # convenience variables
 B, T = args.device_batch_size, args.sequence_length
@@ -184,7 +229,6 @@ else:
 #tokens_per_iter = train_accumulation_steps * ddp_world_size * batch_size * block_size
 #print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
-
 # calculate the number of steps to take in the val loop.
 assert args.val_tokens % (B * T * ddp_world_size) == 0
 val_steps = args.val_tokens // (B * T * ddp_world_size)
@@ -203,22 +247,12 @@ x, y = train_loader.next_batch()
 if master_process:
     print("Building model...")
 
-#tinystories
-#num_vocab=50304 for non-tinystories models
-#qknorm="identitynorm" for nonqknorm models
-layer_prefab = {"dim":768,"dim_head":64,"headcount":12,"ff_mult":4, 
-"lambda":True,"layerwisenorm":"rmsnorm","qknorm":"dynamic_shape_rmsnorm", 
-"attention_deux":True, "training_seqlen":args.sequence_length}
-#global_prefab = {"vocab_size":8192, "num_layers":4}
-#weird errors
-global_prefab = {"vocab_size":50304, "num_layers":4}
-config = {}
-config.update(layer_prefab)
-config.update(global_prefab)
-
-model = pgptlformer.PGPT_Lformer(config)
-if hasattr(config, "coordinate_descent_tuning"):
-    config.coordinate_descent_tuning = True # suggested by @Chillee
+# --- REVISED: Model instantiation is now much cleaner ---
+# No more creating a config dict. We just pass the one from our args object.
+model = pgptlformer.PGPT_Lformer(args.model_config)
+if hasattr(tconfig, "coordinate_descent_tuning"):
+    #torch._inductor.config as tconfig
+    tconfig.coordinate_descent_tuning = True # suggested by @Chillee
 model = model.to(device)
 if args.torch_compile:
     model = torch.compile(model)
@@ -281,6 +315,10 @@ if master_process:
         f.write('='*100 + '\n')
         f.write(code)
         f.write('='*100 + '\n')
+        # Log the final, active hyperparameters. asdict() handles the nested dict perfectly.
+        f.write("ACTIVE HYPERPARAMETERS:\n")
+        f.write(json.dumps(asdict(args), indent=4))
+        f.write('\n' + '='*100 + '\n')
         # log information about the hardware/software environment this is running on
         # and print the full `nvidia-smi` to file
         f.write(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:\n")
@@ -343,7 +381,7 @@ for step in range(args.num_iterations + 1):
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.time() - t0)
             # save the state of the training process
-            log = dict(step=step, code=code, model=model.state_dict(), model_args=config, optim_ensemble=[opt.state_dict() for opt in optim_ensemble])
+            log = dict(step=step, code=code, model=model.state_dict(), model_args=args.model_config, optim_ensemble=[opt.state_dict() for opt in optim_ensemble])
             torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
             # start the clock again
             torch.cuda.synchronize()

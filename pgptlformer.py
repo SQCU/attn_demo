@@ -295,6 +295,7 @@ def apply_rotarizer_emb(x, cos, sin):
 #alternate attention to retrieve a shift matrix instead of scale matrix.
 #this will either break the first time it runs or make perfect sense whomstdve doubted it all along
 #REVISION 1:
+#expect to pass this a 'dud' matrix of 1s
 #"""
 def scaled_dot_product_attn_bias(query, key, value, attn_mask=None, dropout_p=0.0,
     is_causal=False, scale=None, enable_gqa=False):
@@ -329,6 +330,7 @@ def scaled_dot_product_attn_bias(query, key, value, attn_mask=None, dropout_p=0.
 #REVISION 2: this doesn't benefit from abstract syntactic similarity to torch sdpa. so we gut it!
 #instead of creating a duds matrix of 1s to occupy the 'value' idx, we sum the shift-QK product directly
 #uncompiled this maybe uses fewer ops; profile and find out.
+#wow that ended up not being as simple as it sounded at first. put a pin in this one.
 """
 def scaled_dot_product_attn_bias(query, key, value, attn_mask=None, dropout_p=0.0,
     is_causal=False, scale=None, enable_gqa=False):
@@ -421,8 +423,12 @@ class PGPT_Lformer(nn.Module):
         ))
         self.tokenpicker_head = nn.Linear(in_features=config["dim"], out_features=config["vocab_size"], bias=False)
         self.tokenpicker_head.weight.data.zero_() #re: @Grad62304977
+        """
+        self.chatbot_tokenpicker_head = nn.Linear(in_features=config["dim"], out_features=config["vocab_size"], bias=False)
+        self.chatbot_tokenpicker_head.weight.data.zero_() #re: @Grad62304977
+        """
 
-    def forward(self, index, targets=None, return_logits=True, return_zloss=False):
+    def forward(self, index, targets=None, return_logits=True, return_zloss=False, chatbot=False):
         x = self.lambdaformer.what_the_embedder_doin(index) # get token embeddings
         x = nn.functional.rms_norm(x, (x.size(-1),)) #re: @Grad62304977
         for decoder in self.lambdaformer.blocks:

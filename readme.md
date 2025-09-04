@@ -54,6 +54,13 @@ running
 took:
 Prepared 1 package in 87m 25s
 Installed 2 packages in 349ms.
+...
+asciiformer (great idea):
+`uv run data\prepare_ascii.py --trainfile data\txt\TinyStoriesV2-GPT4-train.parquet --valfile data\txt\TinyStoriesV2-GPT4-valid.parquet -p tinystories-ascii`
+`uv run python loader.py --config_file configs/ascii_char_model.json`
+update the target strings in sample-ascii.py ()
+`uv run sample-ascii.py`
+
 
 # triton: 
 ...
