@@ -27,7 +27,11 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as tconfig #... as tconfig? what on earth was that? oh okay.
 from torch.nn.parallel import DistributedDataParallel as DDP
+import pyarrow as pa
+import pyarrow.parquet as pq
+from datetime import datetime
 
+from prompt_utils import PromptGenerator 
 import pgptlformer
 
 ### modded-nanogpt distributed dataset loader
@@ -129,6 +133,82 @@ def get_batch(split):
         x, y = x.to(device), y.to(device)
     return x, y
 
+# custom eval pipeline woooooooo~!
+class OnlineRolloutSampler:
+    """
+    Captures autoregressive rollouts from a model during training
+    and logs them to a Parquet file with rich metadata.
+    """
+    def __init__(self, out_dir: str, run_id: str):
+        self.log_file = os.path.join(out_dir, f"rollouts_{run_id}.parquet")
+        self.writer = None
+        self.schema = pa.schema([
+            pa.field('step', pa.int64()),
+            pa.field('timestamp', pa.timestamp('us')),
+            pa.field('hyperparameters', pa.string()), # Store as JSON string
+            pa.field('prompt', pa.string()),
+            pa.field('raw_tokens', pa.list_(pa.int32())),
+            pa.field('raw_logits', pa.binary()), # Store as pickled numpy array
+            pa.field('decoded_text_raw', pa.string()),
+            pa.field('decoded_text_cleaned', pa.string())
+        ])
+        print(f"OnlineRolloutSampler initialized. Logging to: {self.log_file}")
+
+    def capture_and_log(self, model, prompts: list[str], tokenizer, metadata: dict,
+                        max_new_tokens: int, temperature=1.0, top_k=200, device='cuda'):
+        
+        model.eval() # Ensure model is in eval mode
+        prompt_tokens = [tokenizer.encode(p) for p in prompts]
+        x = torch.tensor(prompt_tokens, dtype=torch.long, device=device)
+        with torch.no_grad():
+            with ctx:   #this is for all the autocasts out there in the world
+                for _ in range(max_new_tokens):
+                    x_cond = x if x.size(1) <= metadata['hyperparameters']['model_config']['training_seqlen'] else x[:, -metadata['hyperparameters']['model_config']['training_seqlen']:]
+                    
+                    logits, _, _ = model(x_cond, return_logits=True)
+                    # The logits are bfloat16 here. We should cast them to float32
+                    # for the numerically sensitive softmax, as is standard practice.
+                    logits = logits[:, -1, :].float() / temperature
+                    
+                    if top_k is not None and top_k > 0:
+                        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                        logits[logits < v[:, [-1]]] = -float('Inf')
+                    
+                    probs = F.softmax(logits, dim=-1)
+                    idx_next = torch.multinomial(probs, num_samples=1)
+                    
+                    x = torch.cat((x, idx_next), dim=1)
+        
+        # We now have our batch of rollouts in `output_tokens`
+        
+        # 2. Prepare data for Parquet logging
+        table_data = []
+        for i in range(x.size(0)):
+            tokens_list = x[i].tolist()
+            
+            raw_text = tokenizer.decode(tokens_list)
+            # Simple cleaning: truncate at first <eos>
+            cleaned_text = raw_text.split('<eos>')[0]
+
+            row = {
+                'step': metadata['step'],
+                'timestamp': metadata['timestamp'],
+                'hyperparameters': json.dumps(metadata['hyperparameters']),
+                'prompt': prompts[i],
+                'raw_tokens': tokens_list,
+                'raw_logits': b'', # Placeholder
+                'decoded_text_raw': raw_text,
+                'decoded_text_cleaned': cleaned_text
+            }
+            table_data.append(row)
+            
+        # 3. Write to Parquet file
+        table = pa.Table.from_pylist(table_data, schema=self.schema)
+        if self.writer is None:
+            self.writer = pq.ParquetWriter(self.log_file, self.schema)
+        self.writer.write_table(table)
+        print(f"Logged {len(prompts)} rollouts for step {metadata['step']}.")
+
 ### modded-nanogpt
 ### either 24/16*20=30 batches per 4090 or 24/32*20=15 batches per 4090, 
 ### depending on what kind of v100 tinystories used. 
@@ -152,6 +232,11 @@ class Hyperparameters:
     val_loss_every : int = 200 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 5242880 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 12500 # every how many steps to save the checkpoint? 0 for only at the end
+    #btw rollout capture will cause cuda graph breaks 
+    # so this requires writing attention masking and some other extra stuff to recover lost perf.
+    capture_rollouts_every: int = 0  # 0 to disable, otherwise capture every N steps
+    capture_rollout_prompts_file: str = "data/TinyStories-valid.txt" # Source for prompts
+    capture_rollout_batch_size: int = 32 # How many rollouts to capture at once
     # supercompute boilerplate
     ddp_run : bool = False #this stuff is so nyannoying
     device = "cuda" # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
@@ -310,6 +395,16 @@ if master_process:
     os.makedirs(logdir, exist_ok=True)
     logfile = 'logs/%s.txt' % run_id
     # create the log file
+    if master_process and args.capture_rollouts_every > 0:
+        print("Scroingling eval toingos. Kindly wait.")
+        # NOTE: You'll need a tokenizer instance. We'll use our ASCII one from sample-ascii.py
+        # For a real run, this should be the same tokenizer used for training.
+        from ascii_tokenizer import SimpleASCIITokenizer # Example, adjust as needed
+        tokenizer = SimpleASCIITokenizer()
+        
+        prompt_generator = PromptGenerator(args.capture_rollout_prompts_file)
+        rollout_sampler = OnlineRolloutSampler(logdir, run_id) # Log to the same run directory
+        print("Toingles scroingled.")
     with open(logfile, "w") as f:
         # begin the log by printing this file (the Python code)
         f.write('='*100 + '\n')
@@ -387,6 +482,30 @@ for step in range(args.num_iterations + 1):
             torch.cuda.synchronize()
             t0 = time.time()
 
+    # every once in a (probably longer) while sample autoregressive rollouts from model
+    if master_process and (args.capture_rollouts_every > 0 and (last_step or step % args.capture_rollouts_every == 0)):
+        print("\n--- Capturing online rollouts ---")
+        prompts = prompt_generator.get_prompts(args.capture_rollout_batch_size)
+        
+        metadata = {
+            'step': step,
+            'timestamp': datetime.now(),
+            'hyperparameters': asdict(args)
+        }
+        
+        # The rollout length will be context length - prompt length
+        max_new = args.sequence_length - 32 # Assuming 32-char prompts
+        
+        rollout_sampler.capture_and_log(
+            model.module if args.ddp_run else model, # unwrap DDP model
+            prompts,
+            tokenizer,
+            metadata,
+            max_new_tokens=max_new,
+            device=device
+        )
+        print("--- Finished capturing rollouts ---\n")
+
     # bit confusing: we want to make sure to eval on 0th iteration
     # but also after the very last iteration. so we loop for step <= num_iterations
     # instead of just < num_iterations (one extra due to <=), only to do
@@ -436,6 +555,9 @@ for step in range(args.num_iterations + 1):
             f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} aux_loss:{train_aux_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+
+if master_process and args.capture_rollouts_every > 0:
+    rollout_sampler.close()
 
 # clean up nice
 if args.ddp_run:
