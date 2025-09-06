@@ -9,6 +9,7 @@ dependencies = [
     "datasets>=4.0.0",
     "flash-attn==2.7.2.post1",
     "huggingface-hub>=0.28.1",
+    "matplotlib>=3.10.6",
     "metaphone>=0.6",
     "nltk>=3.9.1",
     "numpy>=2.2.2",

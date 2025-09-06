@@ -135,7 +135,7 @@ class SyntaxAnalyzer:
 
         if not trees_a or not trees_b:
             print("Warning: One or both corpora produced no parsable trees.")
-            return float('nan')
+            return float('nan') #gemini why did you do this >:(
 
         print(f"Calculating Tree Edit Distance cost matrix for {len(trees_a)} x {len(trees_b)} trees using multiprocessing...")
         
@@ -217,8 +217,8 @@ class SemanticTrajectoryAnalyzer:
 # ==============================================================================
 # --- Main Execution Logic ---
 # ==============================================================================
-if __name__ == '__main__':
-    # --- SETUP: Load your generated text and a ground-truth validation set ---
+def main():
+        # --- SETUP: Load your generated text and a ground-truth validation set ---
     # For demonstration, we'll use placeholder text.
     # In a real run, you would load your files like this:
     # with open('path/to/your_model_output.txt', 'r') as f:
@@ -310,3 +310,6 @@ if __name__ == '__main__':
     # For semantics, we use the ORIGINAL text to preserve story boundaries
     semantic_distance = semantic_analyzer.analyze_corpora_distance(ground_truth_text, generated_text)
     print(f"\nSemantic Trajectory Distance (Wasserstein over Feature Vectors): {semantic_distance:.4f} (Lower is better)")
+
+if __name__ == '__main__':
+    main()

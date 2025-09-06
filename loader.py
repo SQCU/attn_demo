@@ -556,9 +556,6 @@ for step in range(args.num_iterations + 1):
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
-if master_process and args.capture_rollouts_every > 0:
-    rollout_sampler.close()
-
 # clean up nice
 if args.ddp_run:
     dist.destroy_process_group()
