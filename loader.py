@@ -7,7 +7,7 @@
 ### set TORCH_CUDNN_SDPA_ENABLED=1
 ### torchrun --standalone --nproc_per_node=1 loader.py
 ### ...
-### uv run python loader.py --config_file configs/ascii_char_model.json
+### uv run python loader.py --config_file configs/ascii_chart5_model.json
 import os
 import sys
 with open(sys.argv[0]) as f:
@@ -31,7 +31,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from datetime import datetime
 
-from prompt_utils import PromptGenerator 
+from prompt_utils import PromptGenerator
+from t5_utils import T5BatchProcessor # <--- ADD THIS
 import pgptlformer
 
 ### modded-nanogpt distributed dataset loader
@@ -256,6 +257,7 @@ class Hyperparameters:
         "lambda": True, # The key 'lambda' is perfectly fine in a dictionary
         "layerwisenorm": "rmsnorm",
         "qknorm": "dynamic_shape_rmsnorm",
+        "is_t5": False, #default to autoregressive
         "attention_deux": True,
         "training_seqlen": 512 # This was hardcoded before, good to have it here
     })
@@ -342,6 +344,26 @@ model = model.to(device)
 if args.torch_compile:
     model = torch.compile(model)
 
+is_t5_model = args.model_config.get("is_t5", False)
+if is_t5_model:
+    if master_process:
+        print("Model is in T5 mode. Initializing T5BatchProcessor.")
+    # You'll need to define where your special token IDs come from.
+    # Let's assume they are defined in your config.
+    # E.g., vocab_size = 256 for ASCII, pad=256, eos=257, mask_start=258
+    pad_token_id = args.model_config.get('pad_token_id')
+    eos_token_id = args.model_config.get('eos_token_id')
+    mask_token_start_id = args.model_config.get('mask_token_start_id')
+
+    if any(tid is None for tid in [pad_token_id, eos_token_id, mask_token_start_id]):
+        raise ValueError("When is_t5=True, the config file must specify 'pad_token_id', 'eos_token_id', and 'mask_token_start_id'.")
+    
+    t5_processor = T5BatchProcessor(
+        mask_token_start_id=mask_token_start_id,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+    )
+
 # here we wrap model into DDP container
 if args.ddp_run:
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -358,10 +380,16 @@ enable_flash_sdp(True)
 enable_mem_efficient_sdp(True)
 enable_math_sdp(False)
 
-# modded-nanogpt optimizer inits
-adam1 = torch.optim.Adam([model.lambdaformer.what_the_embedder_doin.weight], lr=0.3,    betas=(0.9, 0.95) )
-adam2 = torch.optim.Adam([model.tokenpicker_head.weight],                    lr=0.002,  betas=(0.9, 0.95) )
-params = list(model.lambdaformer.blocks.parameters())
+if is_t5_model:
+    # modded-nanogpt optimizer inits
+    adam1 = torch.optim.Adam([model.what_the_embedder_doin.weight], lr=0.3,    betas=(0.9, 0.95) )
+    adam2 = torch.optim.Adam([model.tokenpicker_head.weight],       lr=0.002,  betas=(0.9, 0.95) )
+    params = list(model.encoder.parameters()) + list(model.decoder.parameters())
+else:
+    # modded-nanogpt optimizer inits
+    adam1 = torch.optim.Adam([model.what_the_embedder_doin.weight], lr=0.3,    betas=(0.9, 0.95) )
+    adam2 = torch.optim.Adam([model.tokenpicker_head.weight],       lr=0.002,  betas=(0.9, 0.95) )
+    params = list(model.lambdaformer.blocks.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2]
 adam3 = bnb.optim.Adam8bit(matrix_params, lr=0.02, betas=(0.9, 0.95) ) #tune this, sensitive
@@ -450,9 +478,24 @@ for step in range(args.num_iterations + 1):
         val_loss = 0.0
         val_aux_loss = 0.0
         for _ in range(val_steps):
-            x_val, y_val = val_loader.next_batch()
-            with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
-                _, loss, z_loss = model(x_val, y_val, return_logits=False, return_zloss=args.use_z_loss)
+            x_val_continuous, y_val_continuous = val_loader.next_batch()
+            # --- Apply same conditional logic as in training ---
+            if is_t5_model:
+                masked_inputs, decoder_inputs, target_labels, \
+                encoder_mask, decoder_mask = t5_processor(x_val_continuous)
+                model_args = {
+                    "input_ids": masked_inputs.to(device), "decoder_input_ids": decoder_inputs.to(device),
+                    "targets": target_labels.to(device), "encoder_padding_mask": encoder_mask.to(device),
+                    "decoder_padding_mask": decoder_mask.to(device)
+                }
+            else: # Autoregressive mode
+                padding_mask = torch.ones_like(x_val_continuous)
+                model_args = {
+                    "input_ids": x_val_continuous.to(device), "targets": y_val_continuous.to(device),
+                    "padding_mask": padding_mask.to(device)
+                }
+            with ctx:
+                _, loss, z_loss = model(**model_args, return_logits=False, return_zloss=args.use_z_loss)
                 val_loss += loss.detach()
                 if z_loss is not None:
                     val_aux_loss += z_loss.detach()*args.z_loss_coefficient
@@ -484,6 +527,9 @@ for step in range(args.num_iterations + 1):
 
     # every once in a (probably longer) while sample autoregressive rollouts from model
     if master_process and (args.capture_rollouts_every > 0 and (last_step or step % args.capture_rollouts_every == 0)):
+        if is_t5_model:
+            print("\n--- Skipping online rollouts: T5 model requires a different generation method ---")
+            pass 
         print("\n--- Capturing online rollouts ---")
         prompts = prompt_generator.get_prompts(args.capture_rollout_batch_size)
         
@@ -517,16 +563,39 @@ for step in range(args.num_iterations + 1):
     model.train()
     for i in range(1, train_accumulation_steps+1):
         # forward pass
+        # conditionally process the batch and prepare model arguments
+        if is_t5_model:
+            # Process the continuous batch into a T5 objective
+            masked_inputs, decoder_inputs, target_labels, \
+            encoder_mask, decoder_mask = t5_processor(x)
+            # Prepare keyword arguments for the model
+            model_args = {
+                "input_ids": masked_inputs.to(device),
+                "decoder_input_ids": decoder_inputs.to(device),
+                "targets": target_labels.to(device),
+                "encoder_padding_mask": encoder_mask.to(device),
+                "decoder_padding_mask": decoder_mask.to(device)
+            }
+        else: # Autoregressive mode
+            # Create a simple padding mask (assuming 0 is padding for AR, or none is used)
+            # In your case, the .bin files are unpadded streams, so the mask is all ones.
+            padding_mask = torch.ones_like(x)
+            # Prepare keyword arguments for the model
+            model_args = {
+                "input_ids": x.to(device),
+                "targets": y.to(device),
+                "padding_mask": padding_mask.to(device)
+            }
+
+        # 3. FORWARD pass (now clean and universal)
         with ctx:
-            _, loss, z_loss = model(x, y, return_logits=False, return_zloss=args.use_z_loss)
+            _, loss, z_loss = model(**model_args, return_logits=False, return_zloss=args.use_z_loss)
             train_loss = loss.detach()
             if z_loss is not None:
                 train_aux_loss = z_loss.detach()*args.z_loss_coefficient
                 loss = loss+z_loss*args.z_loss_coefficient
             else:
                 train_aux_loss = 0
-        # advance the dataset for the next batch
-        x, y = train_loader.next_batch()
         # backward pass
         if args.ddp_run:
             if i < train_accumulation_steps:
@@ -534,7 +603,7 @@ for step in range(args.num_iterations + 1):
                     loss.backward()
         else:
             loss.backward() # just sync on the last step
-
+        x, y = train_loader.next_batch()
     for p in model.parameters():    #grad accum normalization?
         p.grad /= train_accumulation_steps
     # skip muon momentum warmup since we're adaming it

@@ -42,7 +42,7 @@ import math
 ### actually because we cranked up the swiggy_dim by 2x, it follows all of our scaling rules
 ### lmao, lol, lol, lmao, etcetera.
 class vit22_tformer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, is_decoder=False):
         super().__init__() 
         #query_dim = config["query_dim"] #don't even think about cross_attention
         self.dim = config["dim"]
@@ -51,6 +51,7 @@ class vit22_tformer(nn.Module):
         self.weighted_skipnet = config["lambda"]
         self.denseproj_mul = config["ff_mult"]
         #self.naive_causal = config["is_causal_llm"]
+        self.is_decoder = is_decoder
         #...
         #self.qknormalized_shape = [config["dim_head"],config["training_seqlen"],config["headcount"],config["dim_head"],]
         self.qknormalized_shape = [config["headcount"],config["dim_head"]]
@@ -88,16 +89,24 @@ class vit22_tformer(nn.Module):
             self.queryBproj = nn.Linear(in_features=self.dim, out_features=self.dim, bias=False)
             self.keyBproj = nn.Linear(in_features=self.dim, out_features=self.dim, bias=False)
 
+        # --- NEW: CROSS-ATTENTION layers (only if it's a decoder block) ---
+        if self.is_decoder:
+            self.cross_attn_norm = getnorm(config["layerwisenorm"], shape=self.dim)
+            self.cross_q_proj = nn.Linear(self.dim, self.dim, bias=False)
+            self.cross_kv_proj = nn.Linear(self.dim, self.dim * 2, bias=False) # Project K and V together
+            self.cross_out_proj = nn.Linear(self.dim, self.dim, bias=True)
+
         #dense ('mlp', 'feedforward', 'fully connected', ...) unit
         self.fused_denseproj_in = nn.Linear(in_features=self.dim, out_features=self.fused_swiglu_dim, bias=True) #this is the vit22b part
         self.dense_swiggy = swiglu() #this is kind of superfluous but this is pedagogical programming!
         self.denseproj_out = nn.Linear(in_features=self.denseproj_inner_dim, out_features=self.dim, bias=True)
 
     #[x]
-    def self_attn(self, x, bat_len, seq_len):
+    def self_attn(self, x, attention_mask):
         #norm -> {qkvproj -> qknorm{?}
         #reshape_h_d -> attn -> reshape_d_h} -> attnoutproj
         #project
+        bat_len, seq_len, emb_dim = x.size()
         query   = self.queryproj(x)
         key     = self.keyproj(x)
         value   = self.valueproj(x)
@@ -149,23 +158,24 @@ class vit22_tformer(nn.Module):
         if self.l2normscale is not None:
             y = self.l2normscale*nn.functional.scaled_dot_product_attention(query.transpose(1,2), key.transpose(1,2), value.transpose(1,2), scale=1, is_causal=True)
         else:
-            y = nn.functional.scaled_dot_product_attention(query.transpose(1,2), key.transpose(1,2), value.transpose(1,2), scale=self.scale, is_causal=True)
+            y = nn.functional.scaled_dot_product_attention(query.transpose(1,2), key.transpose(1,2), value.transpose(1,2),
+            attn_mask=attention_mask[:, None, :, :], # SDPA expects [B, H, T, T]
+            scale=self.scale, 
+            #is_causal=True 
+            #switch from is_causal notation to explicit attn mask
+            )
 
         if self.attention_II:
             #REV1
+            bias_mask = attention_mask.to(query.dtype)
             dud = torch.ones_like(value, dtype=query.dtype, device=query.device)
             y = y + scaled_dot_product_attn_bias(   #~~attempt to reuse whatever efficient kernels we have already~~ nvm
                 biasquery.transpose(1,2) , biaskey.transpose(1,2) , dud.transpose(1,2),
-                scale=self.scale, is_causal=True
+                attn_mask=bias_mask, # Pass the float mask here
+                scale=self.scale,
+                #is_causal=True
+                #switch from is_causal notation to explicit attn mask
                 )
-            """
-            #REV2
-            #attn_bias now sums the shift matrix within the attn_bias operation to our 'value' target.
-            y = scaled_dot_product_attn_bias(   #~~attempt to reuse whatever efficient kernels we have already~~ nvm
-                biasquery.transpose(1,2), biaskey.transpose(1,2), y,
-                scale=self.scale, is_causal=True
-                )
-            """
 
         #reshape scalars from folded position to unfolded position so the ribosome can read the messenger headrna
         #y = self.reshape_dim_heads(self.heads, y)
@@ -176,6 +186,35 @@ class vit22_tformer(nn.Module):
         #...
 
         return self.attnoutproj(y)
+    
+    #[?] --- NEW: CROSS-ATTENTION METHOD ---
+    def cross_attn(self, x, encoder_hidden_states, cross_attention_mask):
+        B, T_decoder, C = x.shape
+        T_encoder = encoder_hidden_states.shape[1]
+
+        # Query from the decoder's state, K/V from the encoder's state
+        q = self.cross_q_proj(x)
+        kv = self.cross_kv_proj(encoder_hidden_states)
+        k, v = kv.chunk(2, dim=-1)
+
+        # Reshape for multi-head attention
+        q = q.view(B, T_decoder, self.heads, self.dim_head)
+        k = k.view(B, T_encoder, self.heads, self.dim_head)
+        v = v.view(B, T_encoder, self.heads, self.dim_head)
+
+        # No rotary embeddings on cross-attention
+        q = self.projnorm(q)
+        k = self.projnorm(k)
+
+        # Perform attention
+        y = nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            attn_mask=cross_attention_mask[:, None, :, :], # Expand for heads
+            scale=self.scale
+        )
+
+        y = y.transpose(1, 2).contiguous().view(B, T_decoder, C)
+        return self.cross_out_proj(y)
 
     #[x]
     def feedfor(self,x):
@@ -186,23 +225,33 @@ class vit22_tformer(nn.Module):
 
     #parallel forward from kingoflolz/mesh-transformer-jax/! check it out!!
     # "discovered by Wang et al + EleutherAI from GPT-J fame"
-    def forward(self, h_states):
+    def forward(self, h_states, attention_mask=None, cross_attention_mask=None, encoder_hidden_states=None):
         # in trad dialect: b->batch, n,i,j,k,l,m,f,a,o -> sequentiality dims,  h->heads, d->embedding dim
-        bat_len, seq_len, emb_dim = h_states.size()
+        # bat_len, seq_len, emb_dim = h_states.size()
         # ^ detritus from modded-nanogpt transpose implementation. profile later ig.
-
         # highly traditional pre layernorm
         inner_states = self.layerwisenorm(h_states)
 
         #crunchy parts
-        attn_out = self.self_attn(inner_states, bat_len, seq_len)
+        attn_out = self.self_attn(inner_states, attention_mask)
+                
+        # 2. Cross-Attention (only if this is a decoder and encoder states are provided)
+        if self.is_decoder and encoder_hidden_states is not None:
+            #cross_attn_in = self.cross_attn_norm(h_states) # Norm before cross-attn
+            #nice try gemini 2.5! i won't surrender so easily
+            cross_attn_out = self.cross_attn(inner_states, encoder_hidden_states, cross_attention_mask)
+
         dense_out = self.feedfor(inner_states)
         if self.weighted_skipnet==True:
             skip_out = h_states*self.learnedlambda
         else:
             skip_out = h_states
         #output w/ unabstracted resnet
-        return skip_out + dense_out + attn_out
+        if self.is_decoder and encoder_hidden_states is not None:
+            #HYA! PARALLEL X-ATTN & S-ATTN! THE FORBIDDEN TECHNIQUE!
+            return skip_out + dense_out + attn_out + cross_attn_out
+        else:
+            return skip_out + dense_out + attn_out
 
 def getnorm(type, shape=None):
     if type == "layernorm":
@@ -239,7 +288,7 @@ class dynamic_shape_rmsnorm(nn.Module):
         #wait the notation in the paper suggests... [3:].
         inner_shape = inputter.size()[3:]   
 
-        nn.functional.rms_norm(inputter, normalized_shape=inner_shape, **kwargs)   
+        inputter = nn.functional.rms_norm(inputter, normalized_shape=inner_shape, **kwargs)   
         inputter = inputter.transpose(1,2)                  #reverse rotate!
         return inputter
 
@@ -251,7 +300,7 @@ class dynamic_shape_layernorm(nn.Module):
         #wait the notation in the paper suggests... [3:].
         inner_shape = inputter.size()[3:]   
 
-        nn.functional.layer_norm(inputter, normalized_shape=inner_shape, **kwargs)   
+        inputter = nn.functional.layer_norm(inputter, normalized_shape=inner_shape, **kwargs)   
         inputter = inputter.transpose(1,2)                  #reverse rotate!
         return inputter
 
@@ -266,7 +315,9 @@ class swiglu(nn.Module):
 class rotarizer(nn.Module):
     def __init__(self, dim, base=1000): #shhh don't tell anyone about the rotemb base
         super().__init__()
-        self.inv_freq = (base ** (torch.arange(0,dim,2).float() / dim))**-1
+        inv_freq = (base ** (torch.arange(0,dim,2).float() / dim))**-1
+        self.register_buffer("inv_freq", inv_freq, persistent=False) # persistent=False is recommended for non-stateful buffers
+
         self.seq_len_cached = None
         self.cos_cached = None
         self.sin_cached = None
@@ -300,29 +351,16 @@ def apply_rotarizer_emb(x, cos, sin):
 def scaled_dot_product_attn_bias(query, key, value, attn_mask=None, dropout_p=0.0,
     is_causal=False, scale=None, enable_gqa=False):
     #make sure you compile this or it will be slow! haha! it will be slow otherwise! haha!
-    L, S = query.size(-2), key.size(-2)
     scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale 
-    #inversion of normal masking since we're not softmaxing
-    attn_bias = torch.ones(L, S, dtype=query.dtype, device=query.device)
-
-    if is_causal:   #sounds caus-tly to change haha heeehehee
-        assert attn_mask is None
-        temp_mask = torch.ones(L, S, dtype=torch.bool, device=query.device).tril(diagonal=0)
-        attn_bias.masked_fill_(temp_mask.logical_not(), float("0")) #0 not neginf
-        attn_bias.to(query.dtype)
-
-    if attn_mask is not None:   #more boilerplate ty pytorch
-        if attn_mask.dtype == torch.bool:
-            attn_bias.masked_fill_(attn_mask.logical_not(), float("0")) #0 not neginf
-        else:
-            attn_bias *= attn_mask
-
     if enable_gqa:  #who can say what this does
         key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
         value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
 
-    attn_magnitude = torch.matmul(query, key.transpose(-2, -1)) * scale
-    attn_magnitude *= attn_bias    #* to combine instead of +
+    attn_magnitude = torch.matmul(query, key.transpose(-2, -1)) * scale_factor
+    if attn_mask is not None:
+        # The attn_mask is [B, T, T]. attn_magnitude is [B, H, T, T].
+        # We unsqueeze the mask to make them broadcast-compatible.
+        attn_magnitude *= attn_mask[:, None, :, :]
     #attn_magnitude = torch.softmax(attn_weight, dim=-1)   we dont want this lol
     attn_magnitude = torch.dropout(attn_magnitude, dropout_p, train=True)
     return attn_magnitude @ value
@@ -348,6 +386,28 @@ def reshape_dim_heads(heads, tensor):
     tensor = tensor.permute(0, 2, 1, 3).reshape(bat_len // head_len, seq_len, emb_dim*head_len)
     return tensor
 
+def create_attention_mask(padding_mask, is_causal):
+    """
+    Creates a boolean attention mask from a pre-computed padding mask.
+    - `padding_mask` is a [B, T] boolean tensor (True for real tokens).
+    - `is_causal` controls the application of a causal mask.
+    
+    Returns a boolean mask of shape [B, T, T] where True means "attend".
+    """
+    B, T = padding_mask.shape
+    
+    # 1. Expand padding mask to [B, T, T] for key visibility.
+    # A query at position `q` can attend to a key at position `k` if padding_mask[k] is True.
+    attention_mask = padding_mask[:, None, :].expand(B, T, T)
+    
+    if is_causal:
+        # 2. Get a causal mask of shape [T, T]
+        causal_mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=padding_mask.device))
+        
+        # 3. Combine them. The final value is True only if both masks are True.
+        attention_mask = attention_mask & causal_mask[None, :, :]
+        
+    return attention_mask
 
 ###
 ### modelwise config:
@@ -357,25 +417,47 @@ class PGPT_Lformer(nn.Module):
     def __init__(self,config):
         super().__init__()
         self.config = config
+        self.is_t5 = config.get("is_t5", False)
+        
+        self.what_the_embedder_doin = nn.Embedding(config["vocab_size"], config["dim"])
 
-        self.lambdaformer = nn.ModuleDict(dict(
-            what_the_embedder_doin = nn.Embedding(config["vocab_size"], config["dim"]),
-            blocks = nn.ModuleList([vit22_tformer(config) for _ in range(config["num_layers"])])
-        ))
+        if self.is_t5:
+            # T5 uses two separate stacks
+            self.encoder = nn.ModuleList([vit22_tformer(config, is_decoder=False) for _ in range(config["num_layers"])])
+            self.decoder = nn.ModuleList([vit22_tformer(config, is_decoder=True) for _ in range(config["num_layers"])])
+            # We need to modify vit22_tformer to accept encoder_hidden_states for cross-attention
+        else:
+            # Autoregressive blocks are not 'decoders' t. 'gemini2.5'
+            self.lambdaformer = nn.ModuleDict(dict(
+                blocks = nn.ModuleList([vit22_tformer(config, is_decoder=False) for _ in range(config["num_layers"])])
+            ))
         self.tokenpicker_head = nn.Linear(in_features=config["dim"], out_features=config["vocab_size"], bias=False)
         self.tokenpicker_head.weight.data.zero_() #re: @Grad62304977
         """
         self.chatbot_tokenpicker_head = nn.Linear(in_features=config["dim"], out_features=config["vocab_size"], bias=False)
         self.chatbot_tokenpicker_head.weight.data.zero_() #re: @Grad62304977
         """
+    def forward(self, *args, **kwargs):
+        if self.is_t5:
+            # T5-style forward pass
+            return self.forward_t5(*args, **kwargs)
+        else:
+            # Original autoregressive forward pass
+            return self.forward_arg(*args, **kwargs)
 
-    def forward(self, index, targets=None, return_logits=True, return_zloss=False, chatbot=False):
-        x = self.lambdaformer.what_the_embedder_doin(index) # get token embeddings
+    def forward_arg(self, input_ids, targets=None, padding_mask=None, return_logits=True, return_zloss=False, chatbot=False):
+        if padding_mask is None:
+            # Assume no padding if mask isn't provided
+            padding_mask = torch.ones_like(input_ids)
+        # is_causal=True for autoregressive model
+        attn_mask = create_attention_mask(padding_mask, is_causal=True)
+
+        x = self.what_the_embedder_doin(input_ids) # get token embeddings
         x = nn.functional.rms_norm(x, (x.size(-1),)) #re: @Grad62304977
         for decoder in self.lambdaformer.blocks:
-            x = decoder(x)
+            x = decoder(x, attention_mask=attn_mask)
         x = nn.functional.rms_norm(x, (x.size(-1),)) #re: @Grad62304977
-        
+        pad_token_id = self.config.get("pad_token_id")
         if targets is not None:
             #grab some losses woooo
             logits  = self.tokenpicker_head(x)
@@ -384,7 +466,7 @@ class PGPT_Lformer(nn.Module):
                 z_loss = torch.log(z)**2 #log and square Z. make sure to set a coefficient in trainer!
             logits  = 30 * torch.tanh(logits / 30) # @Grad62304977
             logits  = logits.float() # use tf32/fp32 for logits
-            loss    = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss    = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=pad_token_id )
         else: 
             #kellerjordan optimi
             logits  = self.tokenpicker_head(x[:, [-1], :])   # re: kj: note: using list [-1] to preserve the time dim
@@ -399,3 +481,90 @@ class PGPT_Lformer(nn.Module):
             z_loss = None
         
         return logits, loss, z_loss
+
+    def forward_t5(self, input_ids, decoder_input_ids, targets, encoder_padding_mask, decoder_padding_mask, return_logits=True, return_zloss=False):
+        # 1. Create ENCODER mask (bidirectional + padding)
+        # The model receives the padding_mask and determines causality internally.
+        encoder_attn_mask = create_attention_mask(encoder_padding_mask, is_causal=False)
+        encoder_hidden_states = self.what_the_embedder_doin(input_ids)
+        encoder_hidden_states = nn.functional.rms_norm(encoder_hidden_states, (encoder_hidden_states.size(-1),)) #re: @Grad62304977
+        for block in self.encoder:
+            encoder_hidden_states = block(encoder_hidden_states,  attention_mask=encoder_attn_mask)
+        encoder_hidden_states = nn.functional.rms_norm(encoder_hidden_states, (encoder_hidden_states.size(-1),)) #re: @Grad62304977
+
+        # 2. Decode to reconstruct the original text
+        # The decoder uses causal self-attention and cross-attends to the encoder output
+        decoder_self_attn_mask = create_attention_mask(decoder_padding_mask, is_causal=True)
+        # Create the non-square cross-attention mask
+        # basically shape is [B, T_decoder, T_encoder] which is slightly different or something
+        cross_attn_mask = encoder_padding_mask[:, None, :].expand(
+            -1, decoder_input_ids.shape[1], -1
+        )
+        # Cross-attention mask is just the encoder's padding, but shaped for the decoder's queries
+        decoder_hidden_states = self.what_the_embedder_doin(decoder_input_ids) #re: @Grad62304977
+        for block in self.decoder:
+            # Block must be modified to take encoder_hidden_states and perform cross-attention
+            decoder_hidden_states = block(decoder_hidden_states,
+            attention_mask=decoder_self_attn_mask,
+            cross_attention_mask=cross_attn_mask,
+            encoder_hidden_states=encoder_hidden_states)
+        decoder_hidden_states = nn.functional.rms_norm(decoder_hidden_states, (decoder_hidden_states.size(-1),)) #re: @Grad62304977
+            
+        logits = self.tokenpicker_head(decoder_hidden_states)
+        pad_token_id = self.config.get("pad_token_id")
+        if targets is not None:
+            #grab some losses woooo
+            if return_zloss: #tracking https://arxiv.org/abs/2309.14322 
+                z = torch.sum(torch.exp(logits)) #reduce: e^logit[j]
+                z_loss = torch.log(z)**2 #log and square Z. make sure to set a coefficient in trainer!
+            logits  = 30 * torch.tanh(logits / 30) # @Grad62304977
+            logits  = logits.float() # use tf32/fp32 for logits
+            loss    = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=pad_token_id)
+        else: 
+            logits  = 30 * torch.tanh(logits / 30) # @Grad62304977 
+            logits  = logits.float() # use tf32/fp32 for logits
+            loss    = None
+        return logits, loss, z_loss
+
+    # --- NEW: Method for efficient T5 encoding ---
+    @torch.no_grad()
+    def encode(self, input_ids, encoder_padding_mask):
+        """
+        Runs the encoder once to generate the memory for the decoder.
+        """
+        assert self.is_t5, "encode() is only for T5 models"
+        encoder_attn_mask = create_attention_mask(encoder_padding_mask, is_causal=False)
+        encoder_hidden_states = self.what_the_embedder_doin(input_ids)
+        encoder_hidden_states = nn.functional.rms_norm(encoder_hidden_states, (encoder_hidden_states.size(-1),))
+        for block in self.encoder:
+            encoder_hidden_states = block(encoder_hidden_states, attention_mask=encoder_attn_mask)
+        encoder_hidden_states = nn.functional.rms_norm(encoder_hidden_states, (encoder_hidden_states.size(-1),))
+        return encoder_hidden_states
+
+    # --- NEW: Method for a single T5 decoding step ---
+    @torch.no_grad()
+    def decode_step(self, decoder_input_ids, encoder_hidden_states, encoder_padding_mask):
+        """
+        Runs the decoder for a single step of autoregressive generation.
+        """
+        assert self.is_t5, "decode_step() is only for T5 models"
+        
+        # Create masks for this specific step
+        decoder_padding_mask = (decoder_input_ids != self.config['pad_token_id'])
+        decoder_self_attn_mask = create_attention_mask(decoder_padding_mask, is_causal=True)
+        cross_attn_mask = encoder_padding_mask[:, None, :].expand(-1, decoder_input_ids.shape[1], -1)
+
+        # Get embeddings for the current decoder sequence
+        decoder_hidden_states = self.what_the_embedder_doin(decoder_input_ids)
+        for block in self.decoder:
+            decoder_hidden_states = block(
+                decoder_hidden_states,
+                attention_mask=decoder_self_attn_mask,
+                cross_attention_mask=cross_attn_mask,
+                encoder_hidden_states=encoder_hidden_states
+            )
+        decoder_hidden_states = nn.functional.rms_norm(decoder_hidden_states, (decoder_hidden_states.size(-1),))
+        
+        # Get logits for the *very last* token in the sequence
+        logits = self.tokenpicker_head(decoder_hidden_states[:, [-1], :])
+        return logits

@@ -2,7 +2,7 @@
 class SimpleASCIITokenizer:
     """ A simple tokenizer for the first 256 ASCII characters. """
     def __init__(self):
-        self.chars = [chr(i) for i in range(256)]
+        self.chars = [chr(i) for i in range(128)]
         self.vocab_size = len(self.chars)
         self.char_to_int = {ch: i for i, ch in enumerate(self.chars)}
         self.int_to_char = {i: ch for i, ch in enumerate(self.chars)}
