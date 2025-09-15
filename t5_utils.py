@@ -11,44 +11,51 @@ class T5BatchProcessor:
         print("T5BatchProcessor initialized.")
 
     def __call__(self, batch_x):
-        # batch_x is a tensor of shape [B, T] from our IntelligentAudioLoader
+        # batch_x is a tensor of shape [B, T]
         B, T = batch_x.shape
         
-        masked_inputs = []
-        target_labels = []
+        masked_inputs_list = []
+        raw_targets_list = []
 
         for i in range(B):
             sequence = batch_x[i].tolist()
-            
             input_seq, target_seq = self._create_masked_sequence(sequence)
-            
-            masked_inputs.append(torch.tensor(input_seq, dtype=torch.long))
-            target_labels.append(torch.tensor(target_seq, dtype=torch.long))
+            masked_inputs_list.append(torch.tensor(input_seq, dtype=torch.long))
+            raw_targets_list.append(torch.tensor(target_seq, dtype=torch.long))
         
-        # Pad the batches to be of the same length
+        # 1. Pad the raw sequences.
         padded_inputs = torch.nn.utils.rnn.pad_sequence(
-            masked_inputs, batch_first=True, padding_value=self.pad_token_id
+            masked_inputs_list, batch_first=True, padding_value=self.pad_token_id
         )
-        padded_labels = torch.nn.utils.rnn.pad_sequence(
-            target_labels, batch_first=True, padding_value=self.pad_token_id # Pad with pad_id first
+        padded_targets = torch.nn.utils.rnn.pad_sequence(
+            raw_targets_list, batch_first=True, padding_value=self.pad_token_id
         )
 
-        # --- NEW: Create masks BEFORE returning ---
-        # The mask is simply where the tensor is NOT the pad token. Shape: [B, T]
-        encoder_padding_mask = (padded_inputs != self.pad_token_id)
-        decoder_padding_mask = (padded_labels != self.pad_token_id)
-
-        # Prepare labels for loss function (the only place the -100 sentinel is now used)
-        # dayumn don't do that actually.
-        # padded_labels[padded_labels == self.pad_token_id] = -100
-
-        # The decoder input is the shifted labels, starting with a pad token
-        decoder_inputs = torch.roll(padded_labels, shifts=1, dims=1)
+        # 2. Create the decoder_inputs by shifting the clean padded_targets.
+        decoder_inputs = torch.roll(padded_targets, shifts=1, dims=1)
         decoder_inputs[:, 0] = self.pad_token_id
-        # We must also update its mask to reflect this shift
-        decoder_padding_mask = torch.roll(decoder_padding_mask, shifts=1, dims=1)
-        decoder_padding_mask[:, 0] = self.pad_token_id # The first position is now padding
-        return padded_inputs, decoder_inputs, padded_labels, encoder_padding_mask, decoder_padding_mask
+        
+        # 3. Create the final labels tensor for the loss function.
+        #    Start with a copy and then replace all sentinel tokens with the pad_token_id.
+        labels = padded_targets.clone()
+        
+        # A token is a sentinel if it's the EOS token OR if it's in the mask token range.
+        # Assuming a maximum of 100 sentinel tokens for masking.
+        is_mask_token = (labels >= self.mask_token_start_id) & (labels < self.mask_token_start_id + 100)
+        is_eos_token = (labels == self.eos_token_id)
+        
+        # Create a combined mask for all tokens that should NOT contribute to the loss.
+        sentinel_mask = is_mask_token | is_eos_token
+        
+        # Replace these tokens in the labels tensor with the pad_token_id.
+        labels[sentinel_mask] = self.pad_token_id
+
+        # 4. Create the attention masks based on the model inputs.
+        encoder_padding_mask = (padded_inputs != self.pad_token_id)
+        decoder_padding_mask = (decoder_inputs != self.pad_token_id)
+
+        # 5. Return the final, cleaned labels.
+        return padded_inputs, decoder_inputs, labels, encoder_padding_mask, decoder_padding_mask
 
         """# In your training loop:
         logits, _, _ = model(...)
@@ -121,6 +128,6 @@ class T5BatchProcessor:
                 input_tokens.append(tokens[i])
                 i += 1
         
-        target_tokens.append(self.mask_token_start_id + mask_token_id_counter) # Final sentinel
+        target_tokens.append(self.eos_token_id)
         
         return input_tokens, target_tokens
