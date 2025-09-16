@@ -191,7 +191,7 @@ class AdaptiveCurriculumSampler:
     """
     @torch.no_grad()
     def __init__(self,
-                 num_buckets: int = 7,
+                 num_buckets: int = 8,
                  alpha: float = 1.0,
                  epsilon: float = 0.1,
                  hardness_growth_rate: float = 0.01,
@@ -334,9 +334,8 @@ class AdaptiveCurriculumSampler:
         
     def get_params_from_bucket(self, bucket_index: int) -> (int, float):
         """Converts a bucket index into a concrete span length and mask probability."""
-        #base from span:2
-        min_len = int(2**(bucket_index + 1))
-        max_len = int(2**(bucket_index + 2))
+        min_len = int(2**bucket_index)
+        max_len = int(2**(bucket_index + 1))
         
         # Uniformly sample a span length from within the bucket's range
         avg_span_length = np.random.randint(min_len, max_len)
