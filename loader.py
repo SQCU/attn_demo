@@ -32,7 +32,7 @@ import pyarrow.parquet as pq
 from datetime import datetime
 
 from prompt_utils import PromptGenerator
-from t5_utils import T5BatchProcessor # <--- ADD THIS
+from t5_utils import T5BatchProcessor, AdaptiveCurriculumSampler # <-- ADD SAMPLER
 import pgptlformer
 
 ### modded-nanogpt distributed dataset loader
@@ -210,6 +210,10 @@ class OnlineRolloutSampler:
         self.writer.write_table(table)
         print(f"Logged {len(prompts)} rollouts for step {metadata['step']}.")
 
+def format_tensor_log(tensor: torch.Tensor, precision: int = 2) -> str:
+    """Formats a 1D tensor into a compact string like '[0.12 0.34 ...]'"""
+    return "[" + " ".join([f"{x:.{precision}f}" for x in tensor]) + "]"
+
 ### modded-nanogpt
 ### either 24/16*20=30 batches per 4090 or 24/32*20=15 batches per 4090, 
 ### depending on what kind of v100 tinystories used. 
@@ -354,6 +358,7 @@ if is_t5_model:
     pad_token_id = args.model_config.get('pad_token_id')
     eos_token_id = args.model_config.get('eos_token_id')
     mask_token_start_id = args.model_config.get('mask_token_start_id')
+    vocab_size = args.model_config.get('vocab_size')
 
     if any(tid is None for tid in [pad_token_id, eos_token_id, mask_token_start_id]):
         raise ValueError("When is_t5=True, the config file must specify 'pad_token_id', 'eos_token_id', and 'mask_token_start_id'.")
@@ -362,7 +367,9 @@ if is_t5_model:
         mask_token_start_id=mask_token_start_id,
         pad_token_id=pad_token_id,
         eos_token_id=eos_token_id,
+        vocab_size=vocab_size
     )
+    curriculum_sampler = AdaptiveCurriculumSampler()
 
 # here we wrap model into DDP container
 if args.ddp_run:
@@ -482,7 +489,7 @@ for step in range(args.num_iterations + 1):
             # --- Apply same conditional logic as in training ---
             if is_t5_model:
                 masked_inputs, decoder_inputs, target_labels, \
-                encoder_mask, decoder_mask = t5_processor(x_val_continuous)
+                encoder_mask, decoder_mask = t5_processor(x_val_continuous, avg_span_length=3, mask_prob=0.15)
                 model_args = {
                     "input_ids": masked_inputs.to(device), "decoder_input_ids": decoder_inputs.to(device),
                     "targets": target_labels.to(device), "encoder_padding_mask": encoder_mask.to(device),
@@ -495,11 +502,11 @@ for step in range(args.num_iterations + 1):
                     "padding_mask": padding_mask.to(device)
                 }
             with ctx:
-                _, loss, z_loss = model(**model_args, return_logits=False, return_zloss=args.use_z_loss)
+                _, loss, z_loss, _ = model(**model_args, return_logits=False, return_zloss=args.use_z_loss)
                 val_loss += loss.detach()
                 if z_loss is not None:
                     val_aux_loss += z_loss.detach()*args.z_loss_coefficient
-                del loss, z_loss
+                del loss, z_loss, _
         if args.ddp_run:
             dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
             dist.all_reduce(val_aux_loss, op=dist.ReduceOp.AVG)
@@ -559,15 +566,22 @@ for step in range(args.num_iterations + 1):
     if last_step:
         break
 
+    # NEW: compute task distribution per accumulated batch, not per microbatch
+    if is_t5_model:
+        crsm_diag = curriculum_sampler.get_distribution(device=device)
+        bucket_distribution = crsm_diag['p_final']
+
     # --- train time ---
     model.train()
     for i in range(1, train_accumulation_steps+1):
-        # forward pass
-        # conditionally process the batch and prepare model arguments
+        # batch item construction (if you're reviewing this code make this 10x faster ;) ) 
         if is_t5_model:
             # Process the continuous batch into a T5 objective
+            # this is a very 176k token gem2.5 way of passing variables lol but whatever
             masked_inputs, decoder_inputs, target_labels, \
-            encoder_mask, decoder_mask = t5_processor(x)
+            encoder_mask, decoder_mask, bucket_indices = t5_processor.create_curriculum_batch(
+                x, bucket_distribution, curriculum_sampler)
+
             # Prepare keyword arguments for the model
             model_args = {
                 "input_ids": masked_inputs.to(device),
@@ -587,10 +601,19 @@ for step in range(args.num_iterations + 1):
                 "padding_mask": padding_mask.to(device)
             }
 
-        # 3. FORWARD pass (now clean and universal)
+        # network forward()
         with ctx:
-            _, loss, z_loss = model(**model_args, return_logits=False, return_zloss=args.use_z_loss)
+            _, loss, z_loss, loss_per_seq = model(**model_args, return_logits=False, return_zloss=args.use_z_loss)
             train_loss = loss.detach()
+            # loss_per_seq is literally already mean reduced along non-skipped indices, ergo
+            # loss_per_seq is of shape [B]
+            # we may now pass that right into curriculum_sampler;
+            if is_t5_model:
+                # Update the sampler for each item in the micro-batch
+                for i in range(loss_per_seq.size(0)):
+                    bucket_idx = bucket_indices[i].item()
+                    item_loss = loss_per_seq[i].detach().item()
+                    curriculum_sampler.update(bucket_idx, item_loss)
             if z_loss is not None:
                 train_aux_loss = z_loss.detach()*args.z_loss_coefficient
                 loss = loss+z_loss*args.z_loss_coefficient
@@ -616,12 +639,27 @@ for step in range(args.num_iterations + 1):
     model.zero_grad(set_to_none=True)
     # --- train time is already over ---
 
-     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
+    # logging
+    #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
     if master_process:
         approx_time = training_time_ms + 1000 * (time.time() - t0)
-        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} aux_loss:{train_aux_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+        boring_log = f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} aux_loss:{train_aux_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms"
+        aug_log = ""
+        
+        if is_t5_model:
+            # -- Tier 1: Concise `stdout` log --
+            tgt_l = crsm_diag['target_loss'].item()
+            exp_l = crsm_diag['expected_loss'].item()
+            lmbda = crsm_diag['lambda']
+            p_final_str = format_tensor_log(bucket_distribution, precision=2)
+
+            curriculum_stdout = f"| crclm: Tgt_L:{tgt_l:.2f} Exp_L:{exp_l:.2f} λ:{lmbda:.2f} Dist:{p_final_str}"
+            aug_log += curriculum_stdout
+
+        ultimate_log = boring_log + aug_log
+        print(ultimate_log)
         with open(logfile, "a") as f:
-            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} aux_loss:{train_aux_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+            f.write(ultimate_log+"\n")
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 

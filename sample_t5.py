@@ -12,11 +12,11 @@ import pgptlformer
 # ---
 # --- CONFIGURATION ---
 # The output directory from your T5 training run.
-out_dir = 'logs/ascii-chart5-L4-D768-mkii-c1932d6c-1962-493d-b0b7-78e84e30e4e5' # <-- IMPORTANT: UPDATE THIS TO YOUR RUN'S DIRECTORY
+out_dir = 'logs/ascii-chart5-L4-D768-mkiii-765ee0b7-5a50-45a0-abcf-2c95a75feab7' # <-- IMPORTANT: UPDATE THIS TO YOUR RUN'S DIRECTORY
 checkpoint_name = 'state_step002000.pt'
 
 # Prompt for the model. The script will format this for T5.
-input_text = "Once upon a time,"
+input_text = "<|endoftext|>Once upon a time,"
 
 num_samples = 5
 max_new_tokens = 500

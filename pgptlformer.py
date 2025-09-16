@@ -466,7 +466,15 @@ class PGPT_Lformer(nn.Module):
                 z_loss = torch.log(z)**2 #log and square Z. make sure to set a coefficient in trainer!
             logits  = 30 * torch.tanh(logits / 30) # @Grad62304977
             logits  = logits.float() # use tf32/fp32 for logits
-            loss    = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=pad_token_id )
+            #loss    = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=pad_token_id )
+            loss_fct = nn.CrossEntropyLoss(ignore_index=pad_token_id, reduction='none')
+            loss_per_token = loss_fct(logits.view(-1, logits.size(-1)), targets.view(-1))
+            loss_per_token = loss_per_token.view(logits.size(0), logits.size(1)) # Reshape to [B, T]
+
+            # Calculate the mean loss for each sequence in the batch
+            num_real_tokens = (targets != pad_token_id).sum(dim=1)
+            loss_per_sequence = loss_per_token.sum(dim=1) / num_real_tokens.clamp(min=1) # Shape: [B]
+            loss = loss_per_sequence.mean()
         else: 
             #kellerjordan optimi
             logits  = self.tokenpicker_head(x[:, [-1], :])   # re: kj: note: using list [-1] to preserve the time dim
@@ -480,7 +488,7 @@ class PGPT_Lformer(nn.Module):
         if not return_zloss:
             z_loss = None
         
-        return logits, loss, z_loss
+        return logits, loss, z_loss, loss_per_sequence
 
     def forward_t5(self, input_ids, decoder_input_ids, targets, encoder_padding_mask, decoder_padding_mask, return_logits=True, return_zloss=False):
         # 1. Create ENCODER mask (bidirectional + padding)
@@ -509,22 +517,30 @@ class PGPT_Lformer(nn.Module):
             cross_attention_mask=cross_attn_mask,
             encoder_hidden_states=encoder_hidden_states)
         decoder_hidden_states = nn.functional.rms_norm(decoder_hidden_states, (decoder_hidden_states.size(-1),)) #re: @Grad62304977
-            
-        logits = self.tokenpicker_head(decoder_hidden_states)
         pad_token_id = self.config.get("pad_token_id")
         if targets is not None:
-            #grab some losses woooo
+            logits = self.tokenpicker_head(decoder_hidden_states)
             if return_zloss: #tracking https://arxiv.org/abs/2309.14322 
                 z = torch.sum(torch.exp(logits)) #reduce: e^logit[j]
                 z_loss = torch.log(z)**2 #log and square Z. make sure to set a coefficient in trainer!
             logits  = 30 * torch.tanh(logits / 30) # @Grad62304977
             logits  = logits.float() # use tf32/fp32 for logits
-            loss    = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=pad_token_id)
-        else: 
+            #loss    = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=pad_token_id )
+            loss_fct = nn.CrossEntropyLoss(ignore_index=pad_token_id, reduction='none')
+            loss_per_token = loss_fct(logits.view(-1, logits.size(-1)), targets.view(-1))
+            loss_per_token = loss_per_token.view(logits.size(0), logits.size(1)) # Reshape to [B, T]
+
+            # Calculate the mean loss for each sequence in the batch
+            num_real_tokens = (targets != pad_token_id).sum(dim=1)
+            loss_per_sequence = loss_per_token.sum(dim=1) / num_real_tokens.clamp(min=1) # Shape: [B]
+            loss = loss_per_sequence.mean()
+        else:
+            logits  = self.tokenpicker_head(x[:, [-1], :])  # re: kj:
             logits  = 30 * torch.tanh(logits / 30) # @Grad62304977 
             logits  = logits.float() # use tf32/fp32 for logits
             loss    = None
-        return logits, loss, z_loss
+            loss_per_sequence = None
+        return logits, loss, z_loss, loss_per_sequence
 
     # --- NEW: Method for efficient T5 encoding ---
     @torch.no_grad()

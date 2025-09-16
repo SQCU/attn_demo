@@ -1,0 +1,45 @@
+{
+    "input_bin": "data/tinystories-ascii/tinystories-ascii_train_*.bin",
+    "input_val_bin": "data/tinystories-ascii/tinystories-ascii_val_*.bin",
+    "run_name": "ascii-chart5-L4-D768-mkiii",
+
+    "batch_size": 128, 
+    "device_batch_size": 32, 
+    "sequence_length": 512, 
+    "num_iterations": 2000,
+    "attack":40,
+    "release":256,
+    "weight_decay":0,
+
+    "val_loss_every":300,
+    "val_tokens":5242880,
+    "save_every":1000,
+    "capture_rollouts_every":0,
+    "capture_rollout_prompts_file":"data/txt/TinyStoriesV2-GPT4-valid.parquet",
+    "capture_rollout_batch_size":0,
+
+    "ddp_run":false,
+    "device":"cuda",
+    "torch_compile":true,
+
+    "use_z_loss": true,
+    "z_loss_coefficient": 5e-5,
+
+    "model_config": {
+        "vocab_size": 256,
+        "pad_token_id": 129,
+        "eos_token_id": 130,
+        "mask_token_start_id": 131,
+        "dim": 768,
+        "num_layers": 6,
+        "headcount": 12,
+        "dim_head": 64,
+        "ff_mult": 4,
+        "lambda": true, 
+        "layerwisenorm": "rmsnorm",
+        "qknorm": "dynamic_shape_rmsnorm",
+        "is_t5":true,
+        "attention_deux": true,
+        "training_seqlen": 512 
+    }
+}
