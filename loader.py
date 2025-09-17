@@ -19,6 +19,7 @@ import json
 import argparse
 from dataclasses import dataclass, field, asdict
 
+import pandas as pd # sure why not. import literally everythign that does anything with data. you go gemini2.5.
 import numpy as np
 import torch
 import bitsandbytes as bnb
@@ -111,6 +112,79 @@ class DistributedDataLoader:
             self.advance()
         return x.cuda(), y.cuda()
 
+class IntelligentAudioDataLoader:
+    def __init__(self, npz_path, parquet_path, B, T, process_rank, num_processes):
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.B = B  # Per-device batch size
+        self.T = T  # Sequence length
+
+        print(f"[Rank {self.process_rank}] Initializing IntelligentAudioDataLoader.")
+        
+        # 1. Load the small priority scores into memory
+        priority_df = pd.read_parquet(parquet_path)
+        self.weights = torch.from_numpy(priority_df['priority_score'].values).float()
+        
+        if self.weights.sum() > 0:
+            self.weights /= self.weights.sum()
+        else:
+            self.weights = torch.ones_like(self.weights) / len(self.weights)
+
+        # 2. Open the large token array using memory-mapping
+        print(f"[Rank {self.process_rank}] Memory-mapping tokens from {npz_path}...")
+        self.tokens_memmap = np.load(npz_path, mmap_mode='r')['tokens'][0, :]
+
+        self.total_tokens = len(self.tokens_memmap)
+        self.num_chunks = len(self.weights)
+        self.chunk_size_tokens = self.total_tokens // self.num_chunks
+
+        print(f"[Rank {self.process_rank}] Setup complete. Total tokens: {self.total_tokens}")
+
+    def next_batch(self):
+        """
+        Samples a batch of *clean* token indices using priority scores,
+        then reads T+1 tokens from the memory-mapped file to produce (x, y).
+        This maintains a consistent API with other data loaders.
+        """
+        # Each process samples its own indices independently
+        selected_chunk_indices = torch.multinomial(self.weights, num_samples=self.B, replacement=True)
+        
+        # Prepare batch tensors on CPU
+        batch_x_np = np.zeros((self.B, self.T), dtype=np.int64)
+        batch_y_np = np.zeros((self.B, self.T), dtype=np.int64)
+
+        for i, chunk_idx in enumerate(selected_chunk_indices):
+            # Center the sequence on the chosen chunk's start
+            start_token = (chunk_idx.item() * self.chunk_size_tokens) - (self.T // 2)
+            
+            # We need T+1 tokens to create x and y
+            end_token = start_token + self.T + 1
+            
+            # Boundary checks
+            if start_token < 0:
+                start_token = 0
+                end_token = start_token + self.T + 1
+
+            if end_token > self.total_tokens:
+                end_token = self.total_tokens
+                start_token = end_token - (self.T + 1)
+            
+            # Read only the required slice from disk into a numpy array
+            buf = self.tokens_memmap[start_token:end_token]
+            
+            # Create x and y from the buffer
+            batch_x_np[i] = buf[:-1]
+            batch_y_np[i] = buf[1:]
+
+        # Convert the final numpy batches to torch tensors and move to GPU
+        x = torch.from_numpy(batch_x_np).cuda()
+        y = torch.from_numpy(batch_y_np).cuda()
+        
+        return x, y
+
+    def reset(self):
+        # This loader is stateless, but we need the method for API consistency
+        pass
 # -----------------------------------------------------------------------------
 # downgrade to poor man's data loader:
 # maybe superfluous bc distributed data loader started working
@@ -222,8 +296,11 @@ def format_tensor_log(tensor: torch.Tensor, precision: int = 2) -> str:
 @dataclass
 class Hyperparameters:
     # data hyperparams
+    data_format : str = "bin" 
     input_bin : str = 'data/tinystories-pqt/tinystories-pqt_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/tinystories-pqt/tinystories-pqt_val_*.bin' # input .bin to eval validation loss on
+    input_npz: str = "",
+    priority_scores_parquet: str = "",
     run_name : str = "re-pqt-rmsXrmsx3-ATTNII_fast"
     # optimization hyperparams
     batch_size : int = 4*64 # macrobatch size, in sequences, across all devices
@@ -327,12 +404,27 @@ val_steps = args.val_tokens // (B * T * ddp_world_size)
 assert args.batch_size % (B * ddp_world_size) == 0
 train_accumulation_steps = args.batch_size // (B * ddp_world_size)
 
-# load tokens 
-train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
-if master_process:
-    print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
-    print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+# load tokens
+if args.data_format == "bin":
+    if master_process:
+        print(f"Using 'bin' data format from {args.input_bin}")
+    train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+    # Only create val_loader if val_tokens is specified
+    val_loader = None
+    if args.val_tokens > 0:
+        val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+    if master_process:
+        print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
+        print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+elif args.data_format == "audio":
+    if master_process:
+        print(f"Using 'audio' data format from {args.input_npz}")
+    train_loader = IntelligentAudioDataLoader(args.input_npz, args.priority_scores_parquet, B, T, ddp_rank, ddp_world_size)
+    # For now, validation will just re-sample from the training distribution
+    val_loader = train_loader 
+    # A proper val set would use a different npz/parquet file.
+else:
+    raise ValueError(f"Unknown data_format: {args.data_format}. Must be 'bin' or 'audio'.")
 x, y = train_loader.next_batch()
 
 if master_process:
@@ -474,63 +566,69 @@ for step in range(args.num_iterations + 1):
         t0 = time.time()
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
+    if master_process and (last_step or (args.save_every != 0 and step % args.save_every == 0)):
+        # stop the clock
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.time() - t0)
+        # save the state of the training process
+        log = dict(step=step, code=code, model=model.state_dict(), model_args=args.model_config, optim_ensemble=[opt.state_dict() for opt in optim_ensemble])
+        torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+        # start the clock again
+        torch.cuda.synchronize()
+        t0 = time.time()
+
     # once in a while evaluate the validation dataset
-    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+    if ((last_step and val_steps > 0) or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)
         # run validation batches
         model.eval()
-        val_loader.reset()
-        val_loss = 0.0
-        val_aux_loss = 0.0
-        for _ in range(val_steps):
-            x_val_continuous, y_val_continuous = val_loader.next_batch()
-            # --- Apply same conditional logic as in training ---
-            if is_t5_model:
-                masked_inputs, decoder_inputs, target_labels, \
-                encoder_mask, decoder_mask = t5_processor(x_val_continuous, avg_span_length=3, mask_prob=0.15)
-                model_args = {
-                    "input_ids": masked_inputs.to(device), "decoder_input_ids": decoder_inputs.to(device),
-                    "targets": target_labels.to(device), "encoder_padding_mask": encoder_mask.to(device),
-                    "decoder_padding_mask": decoder_mask.to(device)
-                }
-            else: # Autoregressive mode
-                padding_mask = torch.ones_like(x_val_continuous)
-                model_args = {
-                    "input_ids": x_val_continuous.to(device), "targets": y_val_continuous.to(device),
-                    "padding_mask": padding_mask.to(device)
-                }
-            with ctx:
-                _, loss, z_loss, _ = model(**model_args, return_logits=False, return_zloss=args.use_z_loss)
-                val_loss += loss.detach()
-                if z_loss is not None:
-                    val_aux_loss += z_loss.detach()*args.z_loss_coefficient
-                del loss, z_loss, _
-        if args.ddp_run:
-            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-            dist.all_reduce(val_aux_loss, op=dist.ReduceOp.AVG)
-        val_loss /= val_steps
-        val_aux_loss /= val_steps
-        # log val loss to console and to logfile
-        if master_process:
-            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} val_aux_loss:{val_aux_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
-            with open(logfile, "a") as f:
-                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} val_aux_loss:{val_aux_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
-        # start the clock again
+        if val_loader is None:
+            if master_process:
+                print("something weird about your validation loader happened. like it didn't exist?\nskipping validation~!")
+            pass
+        else:
+            val_loader.reset()
+            val_loss = 0.0
+            val_aux_loss = 0.0
+            for _ in range(val_steps):
+                x_val_continuous, y_val_continuous = val_loader.next_batch()
+                # --- Apply same conditional logic as in training ---
+                if is_t5_model:
+                    masked_inputs, decoder_inputs, target_labels, \
+                    encoder_mask, decoder_mask = t5_processor(x_val_continuous, avg_span_length=3, mask_prob=0.15)
+                    model_args = {
+                        "input_ids": masked_inputs.to(device), "decoder_input_ids": decoder_inputs.to(device),
+                        "targets": target_labels.to(device), "encoder_padding_mask": encoder_mask.to(device),
+                        "decoder_padding_mask": decoder_mask.to(device)
+                    }
+                else: # Autoregressive mode
+                    padding_mask = torch.ones_like(x_val_continuous)
+                    model_args = {
+                        "input_ids": x_val_continuous.to(device), "targets": y_val_continuous.to(device),
+                        "padding_mask": padding_mask.to(device)
+                    }
+                with ctx:
+                    _, loss, z_loss, _ = model(**model_args, return_logits=False, return_zloss=args.use_z_loss)
+                    val_loss += loss.detach()
+                    if z_loss is not None:
+                        val_aux_loss += z_loss.detach()*args.z_loss_coefficient
+                    del loss, z_loss, _
+            if args.ddp_run:
+                dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+                dist.all_reduce(val_aux_loss, op=dist.ReduceOp.AVG)
+            val_loss /= val_steps
+            val_aux_loss /= val_steps
+            # log val loss to console and to logfile
+            if master_process:
+                print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} val_aux_loss:{val_aux_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+                with open(logfile, "a") as f:
+                    f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} val_aux_loss:{val_aux_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
+            # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
 
-        if master_process and (last_step or (args.save_every != 0 and step % args.save_every == 0)):
-            # stop the clock
-            torch.cuda.synchronize()
-            training_time_ms += 1000 * (time.time() - t0)
-            # save the state of the training process
-            log = dict(step=step, code=code, model=model.state_dict(), model_args=args.model_config, optim_ensemble=[opt.state_dict() for opt in optim_ensemble])
-            torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
-            # start the clock again
-            torch.cuda.synchronize()
-            t0 = time.time()
 
     # every once in a (probably longer) while sample autoregressive rollouts from model
     if master_process and (args.capture_rollouts_every > 0 and (last_step or step % args.capture_rollouts_every == 0)):

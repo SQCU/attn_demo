@@ -95,8 +95,21 @@ def analyze_rollouts(rollouts_df: pd.DataFrame, gt_sampler: ParquetSampler, docs
 def generate_plots(results_df, baseline_stats, output_file="rollout_analysis.png"):
     """Generates and saves plots of the analysis results using only matplotlib."""
     print(f"\n--- Generating plots to {output_file} ---")
-    num_metrics = 2 # Syntax and Semantics
-    fig, axes = plt.subplots(num_metrics, 1, figsize=(12, 10), sharex=True)
+    # CHANGED: We now have 3 metrics to plot
+    num_metrics = 3
+    fig, axes = plt.subplots(num_metrics, 1, figsize=(12, 15), sharex=True)
+    #sns.set_theme(style="whitegrid") # Use seaborn for styling if available, otherwise defaults to matplotlib
+
+    # --- NEW: 1. POPS Score Plot ---
+    ax = axes[0]
+    ax.plot(results_df.index, results_df['pops_a'], marker='o', linestyle='-', label='Model POPS (Generated Text)')
+    # Use the mean POPS of the sampled ground truth as the baseline
+    mean_gt_pops = results_df['pops_b'].mean()
+    ax.axhline(mean_gt_pops, color='g', linestyle='--', label=f'Ground Truth Mean POPS ({mean_gt_pops:.2f})')
+    ax.set_title("Phonetic & Orthographic Plausibility (POPS) Evolution")
+    ax.set_ylabel("POPS Score (lower is better)")
+    ax.legend()
+
     
     # --- 1. Syntactic Distance Plot ---
     metric = 'syntax_dist'
@@ -137,6 +150,14 @@ def generate_plots(results_df, baseline_stats, output_file="rollout_analysis.png
     print("Plots saved.")
 
 def main():
+    #PEEK_LOG_FILE = "peek_log.txt"
+    # Initialize the analyzers once to avoid repeated model loading
+    print("Initializing analyzers...")
+    POPS_SCORER = POPSScorer()
+    SYNTAX_ANALYZER = SyntaxAnalyzer()
+    SEMANTIC_ANALYZER = SemanticTrajectoryAnalyzer()
+    print("Analyzers ready.")
+
     parser = argparse.ArgumentParser(description="Analyze model rollouts and perform corpus cartography.")
     parser.add_argument("--rollouts_file", type=str)
     parser.add_argument("--ground_truth_file", type=str)
@@ -146,8 +167,12 @@ def main():
     parser.add_argument("--cartography_subsets", type=int, default=3)
     args = parser.parse_args()
 
+    base_output_path = args.rollouts_file.replace(".parquet", "")
+    peek_log_path = f"{base_output_path}_peek_log.txt"
+    plot_output_path = f"{base_output_path}_analysis.png"
+
     if args.peek:
-        open(PEEK_LOG_FILE, "w").close() 
+        open(peek_log_path, "w").close() 
         print(f"PEEK MODE ENABLED: Using and logging {args.docs_per_sample} docs per comparison.")
 
     # NEW: Instantiate our memory-efficient sampler instead of loading everything
@@ -161,14 +186,8 @@ def main():
     results_df = analyze_rollouts(rollouts_df, gt_sampler, args.docs_per_sample, args.peek)
 
     # 3. Visualize the results
-    generate_plots(results_df, baseline_stats, output_file=f"{args.rollouts_file}_analysis.png")
+    generate_plots(results_df, baseline_stats, output_file=plot_output_path)
 
 if __name__ == '__main__':
-    PEEK_LOG_FILE = "peek_log.txt"
-    # Initialize the analyzers once to avoid repeated model loading
-    print("Initializing analyzers...")
-    POPS_SCORER = POPSScorer()
-    SYNTAX_ANALYZER = SyntaxAnalyzer()
-    SEMANTIC_ANALYZER = SemanticTrajectoryAnalyzer()
-    print("Analyzers ready.")
+
     main()
