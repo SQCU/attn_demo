@@ -40,50 +40,39 @@ def decode_tokens_to_wav():
     # 2. Load the generated token data
     print(f"Loading token data from: {args.input_file}")
     data = torch.load(args.input_file, map_location=args.device)
-    prompts = data['prompts']
-    generated = data['generated']
+    # The keys are now always the same, eliminating branching logic.
+    initial_contexts = data['initial_context']
+    final_rollouts = data['final_rollout']
     model_config = data['model_config']
     
-    num_samples = prompts.shape[0]
-    prompt_length = prompts.shape[1]
-    infill_point = prompt_length // 2
-    
-    print(f"Found {num_samples} samples to decode.")
+    num_samples = initial_contexts.shape[0]
+    print(f"Found {num_samples} samples to decode in a unified format.")
 
-    # 3. Loop through each sample and decode three versions
+    # 2. Loop through each sample and decode the "before" and "after"
     for i in range(num_samples):
         print(f"\n--- Decoding Sample {i+1}/{num_samples} ---")
         
-        # A. The original prompt
-        prompt_tokens = prompts[i]
-        
-        # B. The model's generated in-filling/continuation
-        generated_tokens = generated[i]
-        
-        # C. The final combined audio (prompt first half + generated second half)
-        combined_tokens = torch.cat([prompt_tokens[:infill_point], generated_tokens])
+        initial_context_tokens = initial_contexts[i]
+        final_rollout_tokens = final_rollouts[i]
 
         # Helper function to decode and save a single tensor
         def save_wav(token_tensor, filename_suffix):
-            # Encodec expects shape: [batch, num_codebooks, sequence_length]
-            # Our tensor is [sequence_length], so we add the batch and codebook dims.
+            # Remove padding tokens before decoding for cleaner audio
+            pad_id = model_config.get('pad_token_id', -1) # Default to -1 if not in config
+            if pad_id != -1:
+                token_tensor = token_tensor[token_tensor != pad_id]
+
             codes = token_tensor.unsqueeze(0).unsqueeze(0)
-            
             with torch.no_grad():
-                # The decode function takes a list of tuples: (codes, scale)
-                # For generation, scale is None.
                 waveforms = encodec_model.decode([(codes, None)])
             
-            # Save the resulting waveform
             filename = os.path.join(args.output_dir, f"{run_id}_sample_{i}_{filename_suffix}.wav")
-            # Encodec output is [batch, channels, samples], so we squeeze the batch dim
             torchaudio.save(filename, waveforms.squeeze(0).cpu(), sample_rate=encodec_model.sample_rate)
             print(f"  - Saved {filename}")
 
-        # Decode and save all three versions for easy comparison
-        save_wav(prompt_tokens, "original_prompt")
-        save_wav(generated_tokens, "generated_infill")
-        save_wav(combined_tokens, "combined_final")
+        # Decode and save both versions for easy comparison
+        save_wav(initial_context_tokens, "A_initial_context")
+        save_wav(final_rollout_tokens, "B_final_rollout")
 
     print("\n--- Decoding Complete ---")
 

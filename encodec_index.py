@@ -1,5 +1,5 @@
 # encodec_index.py
-# uv run encodec_index.py --input_audio data\measureformer\MORGPROJ_II.wav --output_npz data\measureformer\mproj_ii.npz
+# uv run encodec_index.py --input_audio data\measureformer\MORGPROJ_II.wav --output_npz data\measureformer\mproj_iii.npz
 import torch
 import torchaudio
 import numpy as np
@@ -118,7 +118,7 @@ def create_encodec_index(input_audio_path: str, output_npz_path: str):
     print(f"Audio duration: {duration_sec:.2f} seconds.")
     
     # NEW: Implement the more aggressive 1/16^2 slicing strategy
-    target_chunks = 256 # 16 * 16
+    target_chunks = 1024 # 16 * 16
     print(f"Using aggressive slicing with target of {target_chunks} chunks.")
     split_points = find_optimal_split_points(wav, model.sample_rate, target_num_chunks=target_chunks)
 

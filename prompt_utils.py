@@ -7,6 +7,7 @@ import os
 import numpy as np  # Added for AudioPromptGenerator
 import pandas as pd # uv pip install pandas pyarrow
 
+
 class PromptGenerator:
     """
     Reads a source text corpus (Parquet or plain text) and provides
@@ -226,3 +227,82 @@ if __name__ == '__main__':
     print("\n" + "="*80)
     print("== Self-Tests Complete ==")
     print("="*80)
+
+from encodec import EncodecModel
+from mformer_utils import tokenize_audio_on_the_fly, analyze_audio_on_the_fly
+from mformer_dataset import Hyperparameters # Import the config class
+
+class OODAudioPromptGenerator:
+    """
+    Performs on-the-fly tokenization and analysis of an arbitrary audio file
+    to generate prompts based on the same structural importance logic used
+    in training.
+    """
+    def __init__(self, ood_audio_path: str, device: str = 'cuda'):
+        """
+        Initializes the generator by running the full analysis pipeline on the
+        provided audio file.
+
+        Args:
+            ood_audio_path (str): Path to the out-of-distribution audio file.
+            device (str): The device to use for Encodec processing.
+        """
+        print(f"--- Initializing OOD Audio Prompt Generator for: {ood_audio_path} ---")
+        
+        # 1. Instantiate analysis components
+        params = Hyperparameters()
+        encodec_model = EncodecModel.encodec_model_24khz().to(device)
+        encodec_model.set_target_bandwidth(6.0) # Match training config
+
+        # 2. Run the on-the-fly pipeline
+        tokens, metadata = tokenize_audio_on_the_fly(ood_audio_path, encodec_model)
+        
+        # NOTE: We use the first codebook stream for length/shape calculations,
+        # which is consistent with the IntelligentAudioLoader.
+        self.tokens_memmap = tokens[0, :] 
+        
+        priority_scores, chunk_size_tokens = analyze_audio_on_the_fly(
+            ood_audio_path, tokens, metadata['frame_rate'], params
+        )
+
+        # 3. Set up internal state to mimic AudioPromptGenerator
+        self.weights = torch.from_numpy(priority_scores).float()
+        if self.weights.sum() > 0:
+            self.weights /= self.weights.sum()
+        else:
+            self.weights = torch.ones_like(self.weights) / len(self.weights)
+
+        self.total_tokens = len(self.tokens_memmap)
+        self.num_chunks = len(self.weights)
+        self.chunk_size_tokens = chunk_size_tokens
+
+        print(f"--- OOD Generator Ready. Found {self.total_tokens} tokens across {self.num_chunks} chunks. ---")
+
+    def get_prompts(self, num_prompts: int, prompt_length: int) -> torch.Tensor:
+        """
+        Samples and returns a batch of prompt sequences from the OOD audio.
+        This method is identical to the one in AudioPromptGenerator.
+        """
+        # (This code is copied directly from the original AudioPromptGenerator.get_prompts)
+        if prompt_length >= self.total_tokens:
+            raise ValueError(f"prompt_length ({prompt_length}) cannot be larger than total_tokens ({self.total_tokens}).")
+
+        selected_chunk_indices = torch.multinomial(
+            self.weights, num_samples=num_prompts, replacement=True
+        )
+        
+        prompts_np = np.zeros((num_prompts, prompt_length), dtype=np.int64)
+
+        for i, chunk_idx in enumerate(selected_chunk_indices):
+            start_token = (chunk_idx.item() * self.chunk_size_tokens) - (prompt_length // 2)
+            start_token = max(0, start_token)
+            end_token = start_token + prompt_length
+            
+            if end_token > self.total_tokens:
+                end_token = self.total_tokens
+                start_token = end_token - prompt_length
+            
+            token_slice = self.tokens_memmap[start_token:end_token]
+            prompts_np[i] = token_slice
+
+        return torch.from_numpy(prompts_np)

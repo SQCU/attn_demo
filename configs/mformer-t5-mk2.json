@@ -1,0 +1,45 @@
+{
+    "data_format": "audio",
+    "input_npz": "data/measureformer/mproj_ii.npz",
+    "priority_scores_parquet": "data/measureformer_analysis/2025-09-17_04-08-55_fbe2.parquet",
+    "run_name": "mformer-t5-l6-mk2",
+
+    "batch_size": 128, 
+    "device_batch_size": 32, 
+    "sequence_length": 512, 
+    "num_iterations": 10000,
+    "attack":40,
+    "release":256,
+    "weight_decay":0,
+
+    "val_loss_every":0,
+    "val_tokens":0,
+    "save_every":1000,
+    "capture_rollouts_every":0,
+    "capture_rollout_batch_size":0,
+
+    "ddp_run":false,
+    "device":"cuda",
+    "torch_compile":true,
+
+    "use_z_loss": true,
+    "z_loss_coefficient": 5e-5,
+
+    "model_config": {
+        "vocab_size": 2048,
+        "pad_token_id": 1024,
+        "eos_token_id": 1025,
+        "mask_token_start_id": 1026,
+        "dim": 768,
+        "num_layers": 6,
+        "headcount": 12,
+        "dim_head": 64,
+        "ff_mult": 4,
+        "lambda": true, 
+        "layerwisenorm": "rmsnorm",
+        "qknorm": "dynamic_shape_rmsnorm",
+        "is_t5":true,
+        "attention_deux": true,
+        "training_seqlen": 512 
+    }
+}

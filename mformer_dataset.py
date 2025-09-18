@@ -6,7 +6,7 @@
 #    uv run mformer_dataset.py
 #
 # 2. To analyze a real encodec artifact:
-#    uv run mformer_dataset.py --analyze_npz data/measureformer/mproj_ii.npz --input_audio data/measureformer/MORGPROJ_II.wav
+#    uv run mformer_dataset.py --analyze_npz data/measureformer/mproj_ii.npz --input_audio data/measureformer/MORGPROJ_II.wav --ema_span_chunks 15
 #
 """
 import numpy as np
@@ -19,13 +19,15 @@ import uuid
 from datetime import datetime
 import pyarrow
 import argparse # NEW: For command-line arguments
+from scipy.ndimage import gaussian_filter1d
 
 # NEW: Lazy imports for audio/plotting to keep stub mode dependency-light
 _plt = None
 _torchaudio = None
 
 from scipy.signal import stft
-
+import sys
+import ffmpeg  # <-- ADD THIS
 # =============================================================================
 # NEW: Principled Hyperparameters
 # =============================================================================
@@ -33,7 +35,7 @@ class Hyperparameters:
     # --- Musical Structure ---
     MAX_TEMPO_BPM = 165.0
     BEATS_PER_MEASURE = 4
-    MEASURES_PER_CHUNK = 2.0
+    MEASURES_PER_CHUNK = 0.5
 
     # --- Analysis Timescales (in seconds) ---
     STABILITY_WINDOW_SEC = 6.0
@@ -99,6 +101,41 @@ def generate_mock_data(num_chunks=2000, feature_dim=3, chunk_size_tokens=150):
     print(f"Generated {num_chunks} feature vectors and {total_tokens} tokens.")
     return features, tokens, Hyperparameters.ENCODEC_FRAME_RATE
 
+# --- NEW, ROBUST AUDIO LOADING FUNCTION ---
+def load_audio_with_ffmpeg(audio_path: str, target_sample_rate: int) -> (torch.Tensor, int):
+    """
+    Uses FFmpeg directly to load and decode any audio file, resampling it to the
+    target sample rate and converting it to mono float32. This is the most
+    robust method for handling arbitrary audio formats.
+    """
+    try:
+        # This command tells FFmpeg to decode the input, resample to target_sample_rate,
+        # convert to mono (ac=1), and output raw 32-bit floating-point PCM audio.
+        out, err = (
+            ffmpeg
+            .input(audio_path)
+            .output('pipe:', format='f32le', acodec='pcm_f32le', ac=1, ar=target_sample_rate)
+            .run(capture_stdout=True, capture_stderr=True)
+        )
+        if err:
+            # Print FFmpeg's error messages to help with debugging
+            print("FFmpeg stderr:", err.decode(), file=sys.stderr)
+
+    except ffmpeg.Error as e:
+        raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
+    except FileNotFoundError:
+        raise RuntimeError(
+            "ffmpeg executable not found. Please install FFmpeg on your system and "
+            "ensure it's in your PATH."
+        )
+
+    # The raw output bytes are converted into a numpy array
+    wav_np = np.frombuffer(out, np.float32)
+    # Convert to a PyTorch tensor and add a channel dimension [C, T]
+    wav_torch = torch.from_numpy(wav_np.copy()).unsqueeze(0)
+    
+    return wav_torch, target_sample_rate
+
 # =============================================================================
 # NO LONGER A STUB: Real Feature Calculation from Audio
 # =============================================================================
@@ -113,7 +150,7 @@ def calculate_features_from_audio(audio_path: str, tokens_shape, frame_rate: flo
         _torchaudio = torchaudio
 
     print(f"Loading raw audio from {audio_path} for feature calculation...")
-    wav, sr = _torchaudio.load(audio_path)
+    wav, sr = load_audio_with_ffmpeg(audio_path, Hyperparameters.ENCODEC_SAMPLE_RATE)
 
     # --- 1. Pre-process Audio ---
     if sr != Hyperparameters.ENCODEC_SAMPLE_RATE:
@@ -208,10 +245,14 @@ def calculate_features_from_audio(audio_path: str, tokens_shape, frame_rate: flo
 # =============================================================================
 class StructuralAnalyzer:
     """Analyzes a feature time series to produce a sampling priority score."""
-    def __init__(self, features, frame_rate: float, chunk_size_tokens: int, params: Hyperparameters):
+    def __init__(self, features, frame_rate: float, chunk_size_tokens: int, params: Hyperparameters, novelty_mode: str = "crossover", stability_mode = "local", ema_span_chunks = 3, blur_sigma = 0.0):
         self.features = features
         self.w_novelty = 0.7
         self.w_instability = 0.3
+        self.novelty_mode = novelty_mode
+        self.stability_mode = stability_mode
+        self.ema_span_chunks = ema_span_chunks
+        self.blur_sigma = blur_sigma
 
         # --- NEW: Convert time-based params to chunk-based params ---
         chunks_per_second = frame_rate / chunk_size_tokens
@@ -237,26 +278,150 @@ class StructuralAnalyzer:
             stability_signal[i] = np.mean(similarities)
         return stability_signal
 
-    def _compute_vector_novelty(self):
-        """Computes novelty based on the magnitude of a vector EMA crossover."""
+    def _compute_predictive_stability(self, velocity_vectors):
+        """
+        Calculates stability by correlating past and present patterns of change.
+        """
+        print("  Computing stability using 'predictive' mode (Sliding Window Correlation)...")
+        
+        radius = args.pred_window_size # e.g., 3
+        window_len = 2 * radius + 1   # e.g., 7
+        lag = args.pred_lag           # e.g., 5
+        
+        num_chunks, _ = velocity_vectors.shape
+        predictive_stability = np.zeros(num_chunks)
+        epsilon = 1e-9
+
+        start_idx = lag + window_len
+        for t in tqdm(range(start_idx, num_chunks - radius), desc="    Calculating Predictive Stability"):
+            
+            # 1. Define the "present" and "past" windows of velocity vectors.
+            #    These are matrices of shape [window_len, 3].
+            present_window = velocity_vectors[t - radius : t + radius + 1]
+            past_window = velocity_vectors[t - lag - radius : t - lag + radius + 1]
+
+            # 2. Calculate the cosine similarity for each corresponding pair of vectors in the windows.
+            #    This can be done efficiently with numpy's einsum for dot products.
+            dot_product = np.einsum('ij,ij->i', past_window, present_window)
+            norm_past = np.linalg.norm(past_window, axis=1)
+            norm_present = np.linalg.norm(present_window, axis=1)
+            
+            # Element-wise similarity for each of the `window_len` pairs
+            similarities = dot_product / ((norm_past * norm_present) + epsilon)
+            
+            # 3. The stability score is the average similarity across the window.
+            #    We clip at 0 because minor numerical errors can make it slightly negative.
+            predictive_stability[t] = np.mean(np.maximum(0, similarities))
+
+        # 4. (Optional but recommended) Rescale the final signal to use the full [0, 1] range.
+        if predictive_stability.max() > 0:
+            predictive_stability = (predictive_stability - predictive_stability.min()) / (predictive_stability.max() - predictive_stability.min())
+
+        return predictive_stability
+
+    def _compute_vector_novelty_crossover(self):
+        # This is the original implementation
         df = pd.DataFrame(self.features)
         fast_ema = df.ewm(span=self.fast_ema_span, adjust=False).mean().values
         slow_ema = df.ewm(span=self.slow_ema_span, adjust=False).mean().values
-        
         novelty_vectors = fast_ema - slow_ema
         scalar_novelty = np.linalg.norm(novelty_vectors, axis=1)
-        
         return (scalar_novelty - scalar_novelty.min()) / (scalar_novelty.max() - scalar_novelty.min())
+
+    def _compute_vector_novelty_velocity(self):
+        print("  Computing novelty using 'velocity' mode...")
+        df = pd.DataFrame(self.features)
+        
+        # 1. Use a very fast EMA to get a smoothed version of the signal.
+        #    A span of 3 is a good choice for a short-term smoothing filter.
+        very_fast_ema = df.ewm(span=3, adjust=False).mean()
+
+        # 2. The "velocity" is the difference between the smoothed signal and its immediate past.
+        #    This is a discrete approximation of the first derivative.
+        velocity_vectors = very_fast_ema.diff().fillna(0).to_numpy()
+        
+        # 3. The scalar novelty is the L2 norm of the velocity vector at each chunk.
+        scalar_novelty = np.linalg.norm(velocity_vectors, axis=1)
+
+        # 4. Normalize the final signal to be in the [0, 1] range.
+        if scalar_novelty.max() > 0:
+            scalar_novelty = (scalar_novelty - scalar_novelty.min()) / (scalar_novelty.max() - scalar_novelty.min())
+        
+        return scalar_novelty, velocity_vectors
+
+    def _compute_vector_novelty_activity(self):
+        """
+        Calculates novelty based on the local variance (activity) of the
+        feature vectors within a sliding window.
+        """
+        print(f"  Computing novelty using 'activity' mode with window size: {args.novelty_window_size}...")
+        
+        # Use pandas rolling window functionality for efficiency
+        df = pd.DataFrame(self.features)
+        window_size = args.novelty_window_size
+
+        # Calculate the rolling variance for each feature column
+        # .rolling() is centered by default, which is perfect.
+        rolling_variances = df.rolling(window=window_size, center=True).var().fillna(0)
+        
+        # The result is a DataFrame of variance vectors. Convert to numpy.
+        variance_vectors = rolling_variances.to_numpy()
+        
+        # 4. The scalar novelty is the L2 norm of the variance vector at each chunk.
+        scalar_novelty = np.linalg.norm(variance_vectors, axis=1)
+
+        # 5. Normalize the final signal to be in the [0, 1] range.
+        if scalar_novelty.max() > 0:
+            scalar_novelty = (scalar_novelty - scalar_novelty.min()) / (scalar_novelty.max() - scalar_novelty.min())
+        
+        return scalar_novelty
 
     def analyze(self):
         """Runs the full analysis pipeline."""
         print("PHASE 2: Generating structural signals...")
-        stability = self._compute_stability()
-        novelty = self._compute_vector_novelty()
+        # NEW: Select novelty calculation based on the mode.
+        if self.novelty_mode == 'activity':
+            novelty = self._compute_vector_novelty_activity()
+        elif self.novelty_mode == 'velocity':
+            novelty = self._compute_vector_novelty_velocity()
+        elif self.novelty_mode == 'crossover':
+            novelty = self._compute_vector_novelty_crossover()
+        else:
+            raise ValueError(f"Unknown novelty_mode: {self.novelty_mode}")
         
-        instability = (1 - stability)**2
-        priority_scores = (self.w_novelty * novelty) + (self.w_instability * instability)
+        if self.stability_mode == 'predictive':
+            # This requires the velocity vectors, so we must be in velocity novelty mode
+            if self.novelty_mode != 'velocity':
+                raise ValueError("'predictive' stability mode requires 'velocity' novelty mode.")
+            stability = self._compute_predictive_stability(v_vecs)
+            
+            # --- THE NEW HEURISTIC ---
+            # We value high novelty (evolving sound)
+            # AND we value high stability (predictable patterns, i.e., loops)
+            # This is very different from the old heuristic!
+            # We want to find a balance. A simple sum or product is a good start.
+            w_novelty = 0.4 # Weight for chaotic/transitional moments
+            w_stability = 0.6 # Weight for structured/rhythmic loops
+
+
+            priority_scores = (w_novelty * novelty) + (w_stability * stability)
+        else:
+            # The original method
+            stability = self._compute_stability()
+            instability = (1 - stability)**2
+            priority_scores = (self.w_novelty * novelty) + (self.w_instability * instability)
+
+        if self.ema_span_chunks > 0:
+            print(f"Applying EMA smoothing with a span of {self.ema_span_chunks} chunks...")
+            # The easiest way to do this is with pandas, which is already a dependency.
+            priority_scores_series = pd.Series(priority_scores)
+            smoothed_scores = priority_scores_series.ewm(span=self.ema_span_chunks, adjust=False).mean()
+            priority_scores = smoothed_scores.to_numpy()
         
+        if self.blur_sigma > 0:
+            print(f"  - Applying Gaussian blur with sigma: {self.blur_sigma}")
+            priority_scores += gaussian_filter1d(priority_scores, sigma=self.blur_sigma)
+
         priority_scores[priority_scores < 0] = 0
         if priority_scores.sum() == 0:
             priority_scores = np.ones_like(priority_scores)
@@ -374,7 +539,52 @@ if __name__ == '__main__':
         default=None,
         help="Path to the corresponding raw audio file (required if --analyze_npz is used)."
     )
+    parser.add_argument(
+        "--ema_span_chunks",
+        type=int,
+        default=0,
+        help="Soften priority sampling by a 'span' of chunks. try like 5-10."
+    )
+    parser.add_argument(
+        "--novelty_mode",
+        type=str,
+        default="crossover",
+        help="crossover|velocity"
+    )
+    parser.add_argument(
+        "--novelty_window_size",
+        type=int,
+        default=3,
+        help=" The radius for the comparison windows. Default: 5."
+    )
+    parser.add_argument(
+        "--blur_sigma",
+        type=float,
+        default=0,
+        help=" The sigma. what?"
+    )
+    parser.add_argument(
+        "--stability_mode",
+        type=str,
+        default="local",
+        help="local|predictive|activity"
+    )
+    parser.add_argument(
+        "--pred_window_size",
+        type=int,
+        default=15,
+        help=" The radius for the comparison windows. Default: 3."
+    )
+    parser.add_argument(
+        "--pred_lag",
+        type=int,
+        default=15,
+        help=" The radius for the comparison windows. Default: 5."
+    )
+
+    
     args = parser.parse_args()
+
 
     # --- Setup ---
     params = Hyperparameters()
@@ -394,7 +604,7 @@ if __name__ == '__main__':
         frame_rate = data['frame_rate'].item()
         
         features = calculate_features_from_audio(
-            args.input_audio, tokens.shape, frame_rate, chunk_size_tokens
+            args.input_audio, tokens.shape, frame_rate, chunk_size_tokens,
         )
         
     else:
@@ -403,7 +613,7 @@ if __name__ == '__main__':
         features, tokens_for_loader, frame_rate = generate_mock_data(chunk_size_tokens=chunk_size_tokens)
     
     # --- PHASE 2 ---
-    analyzer = StructuralAnalyzer(features, frame_rate, chunk_size_tokens, params)
+    analyzer = StructuralAnalyzer(features, frame_rate, chunk_size_tokens, params, novelty_mode=args.novelty_mode, stability_mode=args.stability_mode, ema_span_chunks=args.ema_span_chunks, blur_sigma=args.blur_sigma)
     priority_scores, stability, novelty = analyzer.analyze()
     
     # --- File Naming and Saving ---

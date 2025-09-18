@@ -8,6 +8,7 @@ dependencies = [
     "bitsandbytes>=0.45.1",
     "datasets>=4.0.0",
     "encodec>=0.1.1",
+    "ffmpeg-python>=0.2.0",
     "flash-attn==2.7.2.post1",
     "huggingface-hub>=0.28.1",
     "matplotlib>=3.10.6",
