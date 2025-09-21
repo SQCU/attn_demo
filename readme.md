@@ -19,10 +19,20 @@ a closing remark: these models have been tested, and actually work! they have al
 
 It is recommended to use a virtual environment. `uv` is a fast and effective choice.
 
-```bash
+```
 # Using uv
 uv sync
-
+```
+just kidding!
+```
+#using uv in a cuda context
+uv venv --seed
+uv sync --with cuda
+uv add flash-attn==2.7.2.post1 --no-build-isolation
+#using uv in a cudaless context
+uv venv --seed
+uv sync
+```
 # Alternatively, using pip
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 pip install -r reqqies.txt

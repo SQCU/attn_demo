@@ -10,8 +10,10 @@
 # uv run sample_audio_t5.py --out_dir logs/mformer-t5-l6-mk2-ce62b19e-4718-4f15-bdee-af0ace4e7cc2 --checkpoint_name state_step010000.pt --seed 480 --num_iterations 12 --infill_prob 0.8 --parquet_file data/measureformer_analysis/2025-09-17_04-08-55_fbe2.parquet --autodecode --ood_audio_file "data/ood/Web Mystery (Dreamcast) - A Maze-MkWUe_bhNr4.mp3"
 # uv run sample_audio_t5.py --out_dir logs/mformer-t5-l6-mk2-ce62b19e-4718-4f15-bdee-af0ace4e7cc2 --checkpoint_name state_step010000.pt --seed 480 --num_iterations 12 --infill_prob 0.8 --parquet_file data/measureformer_analysis/2025-09-17_04-08-55_fbe2.parquet --autodecode --ood_audio_file "data/ood/04 Glarthir - Poison (feat. Weebam-Na).mp3"
 # uv run sample_audio_t5.py --out_dir logs/mformer-t5-l6-mk2-ce62b19e-4718-4f15-bdee-af0ace4e7cc2 --checkpoint_name state_step010000.pt --seed 480 --num_iterations 12 --infill_prob 0.8 --parquet_file data/measureformer_analysis/2025-09-17_04-08-55_fbe2.parquet --autodecode --ood_audio_file "data/ood/06. Never Stop The Fucking Rave.flac"
-# 
-
+# uv run sample_audio_t5.py --out_dir logs/mformer-t5-l6-mk2-ce62b19e-4718-4f15-bdee-af0ace4e7cc2 --checkpoint_name state_step010000.pt --seed 420 --num_iterations 3 --parquet_file data/measureformer_analysis/2025-09-17_04-08-55_fbe2.parquet --autodecode --seed 480 --num_iterations 12 --infill_prob 0.8
+# cpu debug run?
+#  uv run sample_audio_t5.py --out_dir logs/mformer-t5-l6-mk2-ce62b19e-4718-4f15-bdee-af0ace4e7cc2 --checkpoint_name state_step010000.pt --seed 420 --num_iterations 3 --parquet_file data/measureformer_analysis/2025-09-17_04-08-55_fbe2.parquet --autodecode --seed 
+480 --num_iterations 3 --infill_prob 0.8 --device cpu --num_samples 1
 """
 
 import os
@@ -78,6 +80,7 @@ unwanted_prefix = '_orig_mod.'
 for k,v in list(state_dict.items()):
     if k.startswith(unwanted_prefix):
         state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+#print(state_dict)
 model.load_state_dict(state_dict)
 model.eval().to(args.device)
 
@@ -352,7 +355,7 @@ final_long_sequences = current_sequences
 # --- STAGE 3: UNIFIED SAVING ---
 # Determine filename based on initialization mode
 suffix = "infilled_rollout" if args.infill else "continued_rollout"
-output_filename = f"{output_filename_stem}_{suffix}.pt"
+output_filename = f"tencache\{output_filename_stem}_{suffix}.pt"
 
 print(f"\nSaving generated token sequences to: {output_filename}")
 torch.save({
@@ -371,7 +374,8 @@ if args.autodecode:
     # Using sys.executable is a robust way to ensure we use the same python environment.
     command = [
         sys.executable, 'decode_audio.py',
-        '--input_file', output_filename
+        '--input_file', output_filename, 
+        "--device", args.device
     ]
     
     try:
