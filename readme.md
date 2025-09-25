@@ -27,13 +27,15 @@ just kidding!
 ```
 #using uv in a cuda context
 uv venv --seed
-uv sync --with cuda
+uv sync --extra cuda
 uv add flash-attn==2.7.2.post1 --no-build-isolation
 #using uv in a cudaless context
 uv venv --seed
 uv sync
 ```
+
 #### so you're running this on primeintellect for a live event...?
+```
 # in this demonstration i leak how i name my keys:
 ssh -i ~/.ssh/primeintellect_ed25519 {user@node_ip} -p 22
 
@@ -72,20 +74,6 @@ uv add flash-attn==2.7.2.post1 --no-build-isolation
 	Terminal B: uv run local_client.py fetch (to listen for results)
     Terminal C: uv run local_client.py monitor (to check the system)
     Terminal C: uv run local_client.py submit --seed 1337 (to kick off a job)
-
-
-```
-
-# Alternatively, using pip
-pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-pip install -r reqqies.txt
-# You may need to install bitsandbytes separately
-pip install bitsandbytes
-```
-For GPU-accelerated attention, you can try installing Flash Attention. This can be time-consuming to compile.
-```bash
-# This can take a very long time (>1 hour on hobbyist computers)
-uv add flash-attn --no-build-isolation
 ```
 
 ### Dry Run: Training a Text Model
