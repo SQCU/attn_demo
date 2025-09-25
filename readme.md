@@ -33,6 +33,22 @@ uv add flash-attn==2.7.2.post1 --no-build-isolation
 uv venv --seed
 uv sync
 ```
+#### so you're running this on primeintellect for a live event...?
+```
+sudo apt-get update
+sudo apt-get install redis-server
+
+sudo systemctl start redis-server
+sudo systemctl status redis-server
+#you might want to confirm you're getting a service-alive status before trying to run any of the service scripts.
+# >q
+uv venv --seed
+uv sync --with cuda
+uv add flash-attn==2.7.2.post1 --no-build-isolation
+
+
+```
+
 # Alternatively, using pip
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 pip install -r reqqies.txt

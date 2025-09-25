@@ -1,0 +1,51 @@
+# --- Central Configuration for T5 Audio Services ---
+
+common:
+  redis_host: "localhost"
+  redis_port: 6379
+  # This queue connects the T5 service (producer) to the Encodec service (consumer)
+  tensor_job_queue: "encodec_decoding_jobs"
+  # Pub/Sub channel to announce when a tensor is ready in Redis
+  job_completion_channel: "t5_jobs_completed"
+  # Prefix for Redis keys where tensors will be stored
+  tensor_key_prefix: "tensors"
+
+t5_service:
+  # The queue this service listens on for new generation requests from a client
+  input_queue: "t5_generation_jobs"
+  device: "cuda"
+  # Group model-specific paths for clarity
+  model:
+    out_dir: "logs/mformer-t5-l6-mk2-ce62b19e-4718-4f15-bdee-af0ace4e7cc2"
+    checkpoint_name: "state_step010000.pt"
+  # Paths to the data files needed for generating initial prompts
+  data:
+    prompt_npz_path: "data/measureformer/mproj_ii.npz"
+    prompt_parquet_path: "data/measureformer_analysis/2025-09-17_04-08-55_fbe2.parquet"
+  # Where to temporarily store the generated tensors before decoding
+  output:
+    tensor_cache_dir: "tencache"
+  # --- NEW: Defaults for the generation process ---
+  # Client jobs can override any of these parameters.
+  generation_defaults:
+    prompt_length: 128
+    tokens_per_step: 512
+    temperature: 1.0
+    top_k: 250
+    infill_prob: 0.0  # Default to 0% chance of infilling. Set to 0.5 for a 50/50 mix.
+    infill_length: 512
+
+encodec_service:
+  device: "cuda"
+  output:
+    audio_dir: "generated_audio"
+  # --- NEW ---
+  # The port for the simple HTTP server to serve the audio files
+  audio_server_port: 8000
+
+local_client:
+  # --- NEW ---
+  # IP address of your PrimeIntellect node for downloading audio
+  remote_server_ip: "YOUR_PRIMEINTELLECT_IP_HERE"
+  # Local directory to save downloaded tensors and audio
+  output_dir: "project_outputs"
