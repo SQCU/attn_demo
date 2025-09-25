@@ -46,6 +46,6 @@ encodec_service:
 local_client:
   # --- NEW ---
   # IP address of your PrimeIntellect node for downloading audio
-  remote_server_ip: "YOUR_PRIMEINTELLECT_IP_HERE"
+  remote_server_ip: "{user@node_ip}"
   # Local directory to save downloaded tensors and audio
   output_dir: "project_outputs"

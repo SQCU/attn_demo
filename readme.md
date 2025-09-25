@@ -34,17 +34,44 @@ uv venv --seed
 uv sync
 ```
 #### so you're running this on primeintellect for a live event...?
-```
+# in this demonstration i leak how i name my keys:
+ssh -i ~/.ssh/primeintellect_ed25519 {user@node_ip} -p 22
+
+#first: tmux or smth
+tmux
+# CONTROL+B %
+#	this induces a vertical diptych
+# thereon CONTROL+B left/right/up/down for terminal selection whatever. it's a modal interface.
+# thereon CONTROL+B x to close the selected pane
+
+# remote persistent t5 sequence->sequence inference server:
+# ...write your remote node IP address INTO the project root config.yaml
+# then transfer models, script, etc.
+rsync -avz -e "ssh -i ~/.ssh/primeintellect_ed25519 -p 22" --exclude .git --exclude .venv mnt/c/dox/ai/attn_demo {user@node_ip}:~
+# naively this can take a long time. like uh. well. it can take a while.
+
+# redis support
 sudo apt-get update
 sudo apt-get install redis-server
-
 sudo systemctl start redis-server
 sudo systemctl status redis-server
-#you might want to confirm you're getting a service-alive status before trying to run any of the service scripts.
-# >q
+# inferenceserv support
+cd attn_demo
+curl -LsSf https://astral.sh/uv/install.sh | sh
 uv venv --seed
-uv sync --with cuda
+uv sync --extra cuda
 uv add flash-attn==2.7.2.post1 --no-build-isolation
+
+# pane up server
+    redis-cli ping (Make sure Redis is running; it should return PONG).
+    Pane 1: uv run t5_service.py
+    Pane 2: uv run encodec_service.py
+    Pane 3: uv run serve_audio.py
+# pane up client
+	Terminal A: ssh -i ~/.ssh/primeintellect_ed25519 -L 6379:localhost:6379 {user@node_ip}
+	Terminal B: uv run local_client.py fetch (to listen for results)
+    Terminal C: uv run local_client.py monitor (to check the system)
+    Terminal C: uv run local_client.py submit --seed 1337 (to kick off a job)
 
 
 ```
