@@ -1,6 +1,6 @@
 logs/**
 data/**
-__pycache__/**
+**/__pycache__/**
 generated_audio/**
 project_outputs/**
 tencache/**
