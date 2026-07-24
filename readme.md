@@ -384,6 +384,66 @@ rerunning something.
   (`layerwisenorm: rmsnorm` -> `elementwise_affine=False`), so no shipped `state_dict` key
   changes; there is a test for that.
 
+### Device-host synchronization: the inventory
+
+every `.item()`, `.tolist()`, `.cpu()`, `.numpy()`, python-side `if` on a tensor value, and
+`torch.cuda.synchronize()` is a pipeline drain: the gpu empties and the host waits. in a
+training loop that is pure loss. this is the accounting, because you cannot fix what you
+have not counted. **no speedup number appears here** -- the work was done and validated on a
+cpu box, so there is nothing honest to report but the counts.
+
+`B` is `device_batch_size`, `A` is `train_accumulation_steps`. the audio configs run B=32,
+A=4.
+
+#### removed
+
+| where | what forced it | fired | now |
+|---|---|---|---|
+| `loader.py` per-sequence curriculum loop | `bucket_indices[i].item()` + `loss_per_seq[i].item()` | **2B per micro-step** = 256/step at B=32,A=4 | one batched drain per optimizer step (**1/step**), replaying the same updates in the same order |
+| `t5_utils.create_curriculum_batch` | `bucket_indices[i].item()` + `batch_x[i].tolist()` inside the per-sequence loop | **2B per micro-step** = 256/step | 2 transfers per micro-step, hoisted out of the loop (**8/step**) |
+| `loader.py` per-step log line | `train_loss.item()`, `train_aux_loss.item()` | 2/step | copied async into pinned host memory, consumed **one step late** (0 blocking) |
+| `loader.py` curriculum log line | `format_tensor_log` iterating a device tensor | num_buckets/step = 8/step | distribution kept on host (where the sampler already lives), 0 |
+| `loader.py` validation loop | `val_loss += loss.detach()` accumulated then `:.4f`-formatted | 2 per val micro-step | accumulated on device, **1 drain per validation pass** |
+| `loader.py` rollout capture | `x[i].tolist()` per captured sequence | B per capture | 1 per capture |
+| `sampler_utils.ar_sample` (was inlined ×3) | none -- no eos handling existed | 0 | 0, and eos support added without adding one |
+| `sampler_utils.t5_decode` (was inlined ×5) | `if has_finished.all()` | **1 per generated token** | 1 per `stop_check_every` (32) tokens; `stop_check_every=0` never syncs |
+| `sample_t5.py` | `if idx_next.item() == eos_id` | **1 per generated token** | same shared loop |
+
+for a 512-token T5 rollout at batch 1, that last row alone is 512 drains -> 16.
+
+#### kept, deliberately
+
+| where | why | frequency |
+|---|---|---|
+| `loader.py` curriculum drain | `AdaptiveCurriculumSampler` runs `scipy.optimize.root_scalar` (brentq): a host-side scalar root find with a data-dependent iteration count. it **cannot** be made device-resident and pretending otherwise would mean contorting the code around a sync that still happens. the sampler's whole state is kept on cpu so the solver itself costs no transfer; the losses have to come to it. | 1 per optimizer step, batched |
+| `loader.py` `torch.cuda.synchronize()` | bounding the timed region honestly. all four calls sit on an **interval boundary** (checkpoint save, validation, start/end of timing) and none are per-step. | on save/val intervals |
+| `loader.py` validation drain | one `torch.stack([...]).cpu()` for the whole pass, on the validation interval | 1 per validation |
+| `torch.cuda.max_memory_allocated()` | end of run | once |
+
+#### identified, NOT changed
+
+`DistributedDataLoader.next_batch` and `IntelligentAudioDataLoader.next_batch` build tensors
+in unpinned host memory and copy them across blocking, once per micro-step. pinning plus
+`non_blocking=True` is the standard fix and is semantics-identical, but it is a cuda-only
+change that cannot be validated on this machine, so it is written down rather than shipped.
+
+#### what changed in the output
+
+the per-step training log line now prints the loss from **step N-1** on the line labelled
+step N. that is the whole cost of the deferred-scalar trick, and it is a change to what is
+*printed*, never to what is *computed*: the loss tensors are untouched and no optimizer ever
+sees these values. the first line is skipped because there is no previous step, and the last
+one is drained after the loop. validation lines are unaffected and still exact.
+
+#### the guard
+
+`tests/test_training_semantics.py` walks `loader.main()` and `sampler_utils.ar_sample` with
+`ast` and fails if a `.item()`/`.tolist()`/`.cpu()`/`.numpy()`/`cuda.synchronize()` appears
+inside an inner loop. the lint is itself checked against a planted offender, because a lint
+that passes by finding nothing anywhere is exactly the kind of instrument this repo keeps
+getting caught by. sync counts in the sampling loops are asserted directly, by patching
+`Tensor.all`/`Tensor.item` and counting calls.
+
 ### Compilation (Triton / Torch Inductor)
 
 if you enjoy compiling code, you will *love* running triton. expect a 4x reduction in gpu memory utilization and a 4x increase in training speed if you compile your models. however, compiling is literal; you must have a c++ compiler configured in your system. a lot of the project notes attached to this repository will guide you towards a combination of dependencies which *permit* compilation, but compilation is never a sure thing in contemporary computing.

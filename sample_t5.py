@@ -8,6 +8,7 @@ from contextlib import nullcontext
 import torch
 import torch.nn as nn
 import pgptlformer
+from sampler_utils import t5_decode as shared_t5_decode, trim_at_eos
 
 # ---
 # --- CONFIGURATION ---
@@ -100,41 +101,19 @@ if torch_compile:
     model.decode_step = torch.compile(model.decode_step)
 
 # --- NEW: T5 Generation Function ---
+# delegated to sampler_utils.t5_decode, which is the one copy of this loop in the repo.
+# the local version checked `if idx_next.item() == eos_id: break` -- a device->host transfer
+# on EVERY generated token, which is a full pipeline drain per token. the shared loop keeps
+# the finished flags on device and checks them on an interval instead.
 def t5_decode(model, encoder_input_ids, max_new_tokens, temperature=1.0, top_k=None):
-    # Get special token IDs from the tokenizer
-    pad_id = enc.pad_token_id
-    eos_id = enc.eos_token_id
-    
-    # 1. ENCODE the prompt (happens only once)
-    encoder_padding_mask = (encoder_input_ids != pad_id)
-    encoder_hidden_states = model.encode(encoder_input_ids, encoder_padding_mask)
-    
-    # 2. Initialize the DECODER sequence
-    # It starts with the pad_token_id, which acts as the "start" token for T5.
-    decoder_input_ids = torch.tensor([[pad_id]], dtype=torch.long, device=device)
-
-    # 3. DECODE token by token (autoregressive loop)
-    for _ in range(max_new_tokens):
-        logits = model.decode_step(decoder_input_ids, encoder_hidden_states, encoder_padding_mask)
-        logits = logits.squeeze(1) / temperature # Shape: [B, Vocab] -> [1, Vocab]
-        
-        # Optional Top-K sampling
-        if top_k is not None:
-            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            logits[logits < v[:, [-1]]] = -float('Inf')
-        
-        probs = nn.functional.softmax(logits, dim=-1)
-        idx_next = torch.multinomial(probs, num_samples=1)
-        
-        # Stop if the model generates the end-of-sequence token
-        if idx_next.item() == eos_id:
-            break
-            
-        # Append the sampled token to the decoder's input sequence
-        decoder_input_ids = torch.cat((decoder_input_ids, idx_next), dim=1)
-        
-    # Return the generated sequence, excluding the initial start token
-    return decoder_input_ids[:, 1:]
+    tape = shared_t5_decode(
+        model, encoder_input_ids, max_new_tokens,
+        pad_id=enc.pad_token_id, eos_id=enc.eos_token_id,
+        # T5 uses pad as its start-of-sequence token.
+        decoder_start_id=enc.pad_token_id,
+        temperature=temperature, top_k=top_k)
+    # Return the generated sequence, excluding the initial start token, truncated at EOS.
+    return trim_at_eos(tape, enc.eos_token_id)[0][None, :]
 
 # --- Format the prompt for T5's denoising objective ---
 # We ask the model to "fill in the blank" after our prompt.
