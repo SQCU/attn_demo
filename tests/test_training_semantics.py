@@ -339,3 +339,62 @@ def test_sampler_utils_inner_loop_has_exactly_one_gated_sync():
         assert not _sync_calls_in(loop), _sync_calls_in(loop)
     # the one stop check is a bool() on an interval, and the interval test guards it
     assert "stop_check_every" in src
+
+
+# --- the deferred scalar log ---------------------------------------------------------------
+# it exists to remove a per-step device sync from the logging path. that only counts if it
+# still reports the right numbers against the right step, and if the last one is not lost.
+
+def test_deferred_log_returns_the_previous_step_not_this_one():
+    from loader import DeferredScalarLog
+    log = DeferredScalarLog(["a", "b"], "cpu")
+    assert log.push(0, {"a": torch.tensor(1.0), "b": torch.tensor(10.0)}) == (None, None)
+    step, got = log.push(1, {"a": torch.tensor(2.0), "b": torch.tensor(20.0)})
+    assert step == 0 and got == {"a": 1.0, "b": 10.0}
+    step, got = log.push(2, {"a": torch.tensor(3.0), "b": torch.tensor(30.0)})
+    assert step == 1 and got == {"a": 2.0, "b": 20.0}
+
+
+def test_deferred_log_drain_yields_the_final_step():
+    """without drain() the last step of every run is never logged at all."""
+    from loader import DeferredScalarLog
+    log = DeferredScalarLog(["a"], "cpu")
+    log.push(0, {"a": torch.tensor(1.0)})
+    log.push(1, {"a": torch.tensor(2.0)})
+    assert log.drain() == (1, {"a": 2.0})
+    assert log.drain() == (None, None), "draining twice must not re-report"
+
+
+def test_deferred_log_is_keyed_not_positional():
+    """named keys are why adding a scalar cannot silently shift every column by one."""
+    from loader import DeferredScalarLog
+    log = DeferredScalarLog(["b", "a"], "cpu")     # deliberately not insertion order
+    log.push(0, {"a": torch.tensor(1.0), "b": torch.tensor(2.0)})
+    log.push(1, {"a": torch.tensor(3.0), "b": torch.tensor(4.0)})
+    assert log.drain()[1] == {"b": 4.0, "a": 3.0}
+    with pytest.raises(KeyError):
+        log.push(2, {"a": torch.tensor(1.0)})      # a missing key is loud, not zero-filled
+
+
+def test_deferred_log_accepts_plain_numbers_as_well_as_tensors():
+    from loader import DeferredScalarLog
+    log = DeferredScalarLog(["a"], "cpu")
+    log.push(0, {"a": 0.0})
+    log.push(1, {"a": torch.tensor(5.0)})
+    assert log.drain() == (1, {"a": 5.0})
+
+
+def test_deferred_log_records_an_event_on_cuda_and_none_on_cpu():
+    """the event is the thing that makes the deferred read CORRECT rather than merely
+    fast: host.copy_(..., non_blocking=True) into pinned memory is asynchronous, and
+    reading it without waiting is a race. asserted structurally, since this suite runs on
+    cpu where there is nothing to race."""
+    import inspect
+    from loader import DeferredScalarLog
+    log = DeferredScalarLog(["a"], "cpu")
+    assert log.event is None and log.is_cuda is False
+    assert log.host.numel() == 1
+    src = inspect.getsource(DeferredScalarLog)
+    assert "self.event.record()" in src, "no event recorded after the async copy"
+    assert "self.event.synchronize()" in src, "the deferred read waits on nothing"
+    assert "non_blocking=self.is_cuda" in src

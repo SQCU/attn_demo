@@ -303,26 +303,60 @@ class DeferredScalarLog:
     line labelled `step:N` are the numbers from step N-1. nothing that is COMPUTED changes --
     the loss tensors themselves are untouched and the optimizer never sees these values.
     the first logged line is skipped because there is no previous step to report.
+
+    THE EVENT IS NOT OPTIONAL. `host.copy_(device_tensor, non_blocking=True)` is
+    asynchronous, and pinned memory is exactly the case where torch will NOT insert an
+    implicit sync for you. reading `host` a step later without waiting on anything is a
+    data race: usually a step of queued work has covered it, and when it has not you print
+    the step before last, or a torn mix of the two, and nothing anywhere says so. so the
+    copy is followed by a recorded cuda Event and the read waits on it. the wait is
+    essentially free precisely because the event is a full training step old -- that is the
+    same argument that justifies deferring in the first place, and it is what makes the
+    deferral correct rather than merely fast.
+
+    keys are named rather than positional so that a caller logging a different SET of
+    scalars (an extra objective term, say) cannot silently shift every column by one.
     """
 
-    def __init__(self, num_scalars: int, device):
-        self.device = device
-        self.staging = torch.zeros(num_scalars, dtype=torch.float32, device=device)
-        pin = torch.device(device).type == "cuda"
-        self.host = torch.zeros(num_scalars, dtype=torch.float32, pin_memory=pin)
-        self.primed = False
+    def __init__(self, keys, device):
+        self.keys = list(keys)
+        self.is_cuda = torch.device(device).type == "cuda"
+        self.host = torch.zeros(len(self.keys), dtype=torch.float32,
+                                pin_memory=self.is_cuda)
+        self.event = torch.cuda.Event() if self.is_cuda else None
+        self.pending_step = None
 
-    def push(self, *scalars):
-        """queue this step's scalars; returns the PREVIOUS step's, or None on the first."""
-        previous = self.host.tolist() if self.primed else None
-        for slot, value in enumerate(scalars):
-            if torch.is_tensor(value):
-                self.staging[slot].copy_(value.detach(), non_blocking=True)
-            else:
-                self.staging[slot].fill_(float(value))
-        self.host.copy_(self.staging, non_blocking=True)
-        self.primed = True
+    def _read(self):
+        if self.event is not None:
+            self.event.synchronize()   # waits on a copy enqueued a full step ago
+        return {k: float(self.host[i]) for i, k in enumerate(self.keys)}
+
+    def push(self, step, scalars):
+        """queue `step`'s scalars (name -> 0-d tensor or number); return the PREVIOUS
+        submission as (step, {name: float}), or (None, None) the first time.
+
+        one stack + one copy, rather than one small copy per scalar: N slot-wise
+        device-to-device copies is N kernel launches to move N floats."""
+        previous = (self.pending_step, self._read()) if self.pending_step is not None \
+            else (None, None)
+        stacked = torch.stack([
+            (v.detach() if torch.is_tensor(v) else torch.tensor(float(v)))
+            .to(torch.float32).reshape(())
+            for v in (scalars[k] for k in self.keys)])
+        self.host.copy_(stacked, non_blocking=self.is_cuda)
+        if self.event is not None:
+            self.event.record()
+        self.pending_step = step
         return previous
+
+    def drain(self):
+        """the final submission is still in flight when the loop ends. without this the
+        last step never gets logged at all."""
+        if self.pending_step is None:
+            return (None, None)
+        out = (self.pending_step, self._read())
+        self.pending_step = None
+        return out
 
 ### modded-nanogpt
 ### either 24/16*20=30 batches per 4090 or 24/32*20=15 batches per 4090, 
@@ -705,7 +739,8 @@ def main(argv=None):
     # train_loss / aux_loss used to be .item()'d on the step that produced them, which is a
     # full device drain per step for the sake of a print statement. they are now copied
     # asynchronously into pinned host memory and read back one step late. see DeferredScalarLog.
-    step_log = DeferredScalarLog(2, device)
+    LOG_KEYS = ("train_loss", "aux_loss")
+    step_log = DeferredScalarLog(LOG_KEYS, device)
     pending_log = None   # (step, aug_log) awaiting the scalars queued on the previous step
 
     for step in range(args.num_iterations + 1):
@@ -946,11 +981,12 @@ def main(argv=None):
                 p_final_str = format_tensor_log(bucket_distribution, precision=2)
                 aug_log += f"| crclm: Tgt_L:{tgt_l:.2f} Exp_L:{exp_l:.2f} λ:{lmbda:.2f} Dist:{p_final_str}"
 
-            # queue this step's scalars, get the previous step's back. no drain.
-            previous = step_log.push(train_loss, train_aux_loss)
+            # queue this step's scalars, get the previous step's back.
+            _, previous = step_log.push(step, {"train_loss": train_loss,
+                                               "aux_loss": train_aux_loss})
             if pending_log is not None and previous is not None:
                 prev_step, prev_aug, prev_time = pending_log
-                prev_loss, prev_aux = previous
+                prev_loss, prev_aux = previous["train_loss"], previous["aux_loss"]
                 ultimate_log = (f"step:{prev_step+1}/{args.num_iterations} "
                                 f"train_loss:{prev_loss:.4f} aux_loss:{prev_aux:.4f} "
                                 f"train_time:{prev_time:.0f}ms "
@@ -962,12 +998,13 @@ def main(argv=None):
             pending_log = (step, aug_log, training_time_ms + 1000 * (time.time() - t0))
 
     if master_process:
-        # drain the one deferred log line still in flight.
+        # drain the one deferred log line still in flight. this used to push a fake
+        # (0.0, 0.0) record just to shift the pipeline; drain() reads it directly.
         if pending_log is not None:
-            previous = step_log.push(0.0, 0.0)
+            _, previous = step_log.drain()
             if previous is not None:
                 prev_step, prev_aug, prev_time = pending_log
-                prev_loss, prev_aux = previous
+                prev_loss, prev_aux = previous["train_loss"], previous["aux_loss"]
                 ultimate_log = (f"step:{prev_step+1}/{args.num_iterations} "
                                 f"train_loss:{prev_loss:.4f} aux_loss:{prev_aux:.4f} "
                                 f"train_time:{prev_time:.0f}ms" + prev_aug)
