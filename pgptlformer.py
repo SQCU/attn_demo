@@ -183,10 +183,17 @@ class vit22_tformer(nn.Module):
     # symmetry to break. it is NOT identity-at-init; a gate that is 1.0 at init would need
     # bias >> 0, which starts the sigmoid saturated and dead. 0.5 sits at the maximum
     # derivative of the sigmoid, so gradient reaches W_g on the first step.
+    # the fork_rng is not incidental. nn.Linear draws from the global generator in its
+    # reset_parameters, so simply constructing the gate would shift the rng stream and give
+    # every parameter created after it different values -- meaning a gate-on run and a
+    # gate-off run at the same seed would differ in the TRUNK too, and the ablation would be
+    # confounded by initialization noise. forking (and immediately zeroing) makes gate="none"
+    # and gate="sigmoid" produce byte-identical trunk weights at a fixed seed. paired A/B.
     def _make_gate(self):
         if self.attn_gate_kind == "none":
             return None
-        gate = nn.Linear(self.dim, self.heads, bias=True)
+        with torch.random.fork_rng(devices=[]):
+            gate = nn.Linear(self.dim, self.heads, bias=True)
         nn.init.zeros_(gate.weight)
         nn.init.zeros_(gate.bias)
         return gate
