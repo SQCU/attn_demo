@@ -130,6 +130,11 @@ body lives in `main()`), and everything below runs on cpu in a few seconds.
   and the device-sync lint (which is itself tested against a planted offender).
 - `test_audio_branch.py` -- the shared decode loop at batch 1 and batch 2, sync counts, and
   ast-level checks over the modules that need the audio stack to import.
+- `test_compile.py` -- all 12 combinations of (gate x attention-II x qknorm), for both the
+  AR and T5 forwards, traced with `torch.compile(fullgraph=True)`. `fullgraph` is the
+  assertion: dynamo raises rather than silently falling back, so a graph break in a new knob
+  fails the suite. backend is `eager`, because what is under test is the trace, not codegen
+  -- inductor needs a c++ toolchain and this has to run on a laptop.
 
 ## Data Flow & Project Workflows
 
