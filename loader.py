@@ -26,7 +26,7 @@ import torch._inductor.config as tconfig #... as tconfig? what on earth was that
 from torch.nn.parallel import DistributedDataParallel as DDP
 from datetime import datetime
 
-from config_utils import ConfigError, cfg_get
+from config_utils import ConfigError, cfg_get, is_doc_key, validate_model_config
 from prompt_utils import PromptGenerator
 from sampler_utils import ar_sample
 from t5_utils import T5BatchProcessor, AdaptiveCurriculumSampler # <-- ADD SAMPLER
@@ -382,7 +382,13 @@ class Hyperparameters:
         "layerwisenorm": "rmsnorm",
         "qknorm": "dynamic_shape_rmsnorm",
         "is_t5": False, #default to autoregressive
-        "attention_deux": True,
+        # was True here while pgptlformer's own cfg_flag(..., default=False) said False:
+        # ONE key with TWO defaults, so a config file that omitted it got attention-II and
+        # a dict built in code did not. aligned to the model's, which is the value that
+        # decides what actually gets constructed. every file in configs/ now states the
+        # key explicitly (MODEL_CONFIG_SCHEMA requires it), so this default is reachable
+        # only by running loader.py with no --config_file at all.
+        "attention_deux": False,
         "attention_deux_norm": "none",  # "none" | "mean" | "inv_sqrt_s", see readme
         "attn_gate": "none",            # "none" | "sigmoid", see readme
         "rotary_embedding_base": 1000,  # yes 1000. deliberate. see pgptlformer.py.
@@ -416,15 +422,21 @@ def merge_config(args: "Hyperparameters", config_data: dict) -> "Hyperparameters
          for eight hours with the setting you thought you had changed still at its default.
     """
     for key, value in config_data.items():
+        # json has no comment syntax. '_'-prefixed keys are documentation -- a config that
+        # cannot record WHY a value is what it is grows decisions nobody can reconstruct --
+        # and they are dropped here rather than carried into the model.
+        if is_doc_key(key):
+            continue
         if key == "model_config":
             if not isinstance(value, dict):
                 raise ConfigError(f"'model_config' must be an object, got {type(value).__name__}")
-            unknown = sorted(set(value) - set(args.model_config))
+            unknown = sorted(k for k in set(value) - set(args.model_config)
+                             if not is_doc_key(k))
             if unknown:
                 raise ConfigError(
                     f"unknown model_config key(s) {unknown}. "
                     f"known keys: {sorted(args.model_config)}")
-            args.model_config.update(value)   # merge, do not replace
+            args.model_config.update({k: v for k, v in value.items() if not is_doc_key(k)})
         elif key in {f.name for f in fields(args)}:
             setattr(args, key, value)
         else:
@@ -434,6 +446,12 @@ def merge_config(args: "Hyperparameters", config_data: dict) -> "Hyperparameters
 
     # Ensure sequence_length is consistent between training params and model params
     args.model_config['training_seqlen'] = args.sequence_length
+    # startup-time schema check on the MERGED config: types, allowed values, ranges, and
+    # dim_head*headcount == dim, reported all at once. this runs once per process, before
+    # any tensor exists. require_present=False because the dataclass has already supplied
+    # every key -- "is it written in the FILE" is checked by tests/test_config_schema.py
+    # against the file itself, which is the only place that question has an answer.
+    validate_model_config(args.model_config, require_present=False)
     return args
 
 

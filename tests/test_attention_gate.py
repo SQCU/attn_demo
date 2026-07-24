@@ -28,8 +28,11 @@ def _t5_batch(vocab=60, pad=60):
 @pytest.mark.parametrize("attention_deux", [False, True])
 @pytest.mark.parametrize("qknorm", ["dynamic_shape_rmsnorm", "l2norm", "identitynorm"])
 def test_gate_none_is_bit_identical_to_gate_absent_ar(attention_deux, qknorm):
-    absent = tiny_config(attention_deux=attention_deux, qknorm=qknorm)
-    explicit = dict(absent, attn_gate="none")
+    explicit = tiny_config(attention_deux=attention_deux, qknorm=qknorm, attn_gate="none")
+    # the fixture states every schema key, so absence is constructed here rather than
+    # inherited from it -- the property under test is "a config that never mentions the
+    # gate builds the identical model", which is what every pre-gate checkpoint relies on.
+    absent = {k: v for k, v in explicit.items() if k != "attn_gate"}
     assert "attn_gate" not in absent
 
     x, y, mask = ar_batch()
@@ -44,8 +47,8 @@ def test_gate_none_is_bit_identical_to_gate_absent_ar(attention_deux, qknorm):
 
 @pytest.mark.parametrize("attention_deux", [False, True])
 def test_gate_none_is_bit_identical_to_gate_absent_t5(attention_deux):
-    absent = tiny_t5_config(attention_deux=attention_deux)
-    explicit = dict(absent, attn_gate="none")
+    explicit = tiny_t5_config(attention_deux=attention_deux, attn_gate="none")
+    absent = {k: v for k, v in explicit.items() if k != "attn_gate"}
     enc, dec, tgt, em, dm = _t5_batch()
     a = build(absent)(enc, dec, tgt, em, dm, return_zloss=True)
     b = build(explicit)(enc, dec, tgt, em, dm, return_zloss=True)

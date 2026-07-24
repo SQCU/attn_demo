@@ -8,16 +8,27 @@ instrument that is itself checked. every test here runs a real forward pass and 
 real numbers, not on the absence of an exception.
 """
 import os
+import pathlib
 import sys
 
 import pytest
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+# tests/test_flex_masks.py and tests/test_lints.py need nothing from this file beyond the
+# path insert above -- they exercise flex_masks.py and the two lints, which import only
+# torch, ast, json and os and know about no model at all. that is the point of them, and
+# it is why they can be read (and run) standalone.
 
 
 def tiny_config(**overrides):
-    """the smallest config that exercises every branch. dim_head*headcount == dim."""
+    """the smallest config that exercises every branch. dim_head*headcount == dim.
+
+    every key of MODEL_CONFIG_SCHEMA is stated, at the value the fixture was already
+    getting implicitly, and assert_schema_complete() below pins that. a fixture that is
+    not a legal config is a fixture that can pass while every shipped file fails."""
     cfg = {
         "vocab_size": 64,
         "num_layers": 2,
@@ -25,12 +36,15 @@ def tiny_config(**overrides):
         "dim_head": 8,
         "headcount": 4,
         "ff_mult": 4,
-        "lambda": True,
+        "training_seqlen": 16,
         "layerwisenorm": "rmsnorm",
         "qknorm": "dynamic_shape_rmsnorm",
+        "lambda": True,
         "is_t5": False,
         "attention_deux": False,
-        "training_seqlen": 16,
+        "attention_deux_norm": "none",
+        "attn_gate": "none",
+        "rotary_embedding_base": 1000,
     }
     cfg.update(overrides)
     return cfg
@@ -67,3 +81,10 @@ def ar_batch(batch=2, seqlen=16, vocab=64, seed=0):
     y = torch.randint(0, vocab, (batch, seqlen), generator=g)
     mask = torch.ones(batch, seqlen, dtype=torch.bool)
     return x, y, mask
+
+
+def assert_schema_complete(cfg):
+    """the fixtures above must be legal shipped configs, not merely configs the model
+    happens to accept. tests/test_config_schema.py calls this on both of them."""
+    from config_utils import validate_model_config
+    return validate_model_config(dict(cfg), where="conftest fixture")

@@ -140,6 +140,9 @@ body lives in `main()`), and everything below runs on cpu in a few seconds.
   test* at tiny shapes. see "BLOCK MASKS FROM BOUNDS" below.
 - `test_lints.py` -- the two lints, each with a planted violation, because a lint that
   finds nothing because it is broken passes every test ever written.
+- `test_config_schema.py` -- every file in `configs/` validates against the documented
+  schema and then builds a model, plus the validator's own failure modes. see "THE MODEL
+  CONFIG SCHEMA" below.
 
 ## Data Flow & Project Workflows
 
@@ -563,6 +566,85 @@ it is not done here. moving the model's attention onto `flex_attention` changes 
 own before/after on real checkpoints. that is a reviewed piece of work of its own, not a
 rider on the module that makes it possible. `flex_masks.py` ships tested and unused by the
 model, which is the honest state of it.
+
+### THE MODEL CONFIG SCHEMA
+
+three things converged on `configs/`: `config_utils.py` reads every key **by value** and
+raises `ConfigError` on missing/mistyped/out-of-range; `loader.merge_config` became strict,
+so an unknown key is an error rather than a warning printed into a wall of startup spam; and
+the model grew knobs (`attn_gate`, `attention_deux_norm`) that default to legacy behavior.
+each of those is individually correct. together they are a trap: a shipped config that omits
+a key either gets **rejected at load** or silently inherits a default nobody chose.
+
+and it is a *class* of bug rather than an incident, because no diff shows it. two configs in
+the same directory that look like siblings can declare different key sets, and the only place
+that difference becomes visible is eight hours into a training run.
+
+so there is now exactly one documented answer to "what is a model config":
+`MODEL_CONFIG_SCHEMA` in `config_utils.py`. print it with:
+
+```
+uv run python -m config_utils
+```
+
+| key | type / allowed | default | in file? | notes |
+| --- | --- | --- | --- | --- |
+| `vocab_size` | int >= 1 | 50304 | **yes** | must cover every special id below |
+| `num_layers` | int >= 1 | 4 | **yes** | a t5 config builds this many *encoder* blocks AND this many decoder blocks |
+| `dim` | int >= 1 | 768 | **yes** | residual stream width; must equal `dim_head*headcount` |
+| `dim_head` | int >= 1 | 64 | **yes** | |
+| `headcount` | int >= 1 | 12 | **yes** | |
+| `ff_mult` | int >= 1 | 4 | **yes** | feed-forward hidden width as a multiple of `dim` |
+| `training_seqlen` | int >= 1 | 512 | **yes** | `loader` OVERWRITES this from the top-level `sequence_length`; a file where the two disagree is a file whose stated shape is a lie, and the test rejects it |
+| `layerwisenorm` | one of `NORM_KINDS` | `"rmsnorm"` | **yes** | |
+| `qknorm` | one of `NORM_KINDS` | `"dynamic_shape_rmsnorm"` | **yes** | |
+| `lambda` | bool | `true` | **yes** | weighted skip connections |
+| `is_t5` | bool | `false` | **yes** | decides which forward path runs, and therefore which other keys mean anything |
+| `attention_deux` | bool | `false` | **yes** | never allowed to be implicit again; see below |
+| `attention_deux_norm` | `none` \| `mean` \| `inv_sqrt_s` | `"none"` | **yes** | `none` is legacy and is what every existing checkpoint was trained with |
+| `attn_gate` | `none` \| `sigmoid` | `"none"` | **yes** | `none` is bit-identical to the pre-gate model |
+| `rotary_embedding_base` | int/float >= 1 | 1000 | **yes** | 1000, not 10000. deliberate. stated in every file precisely because a reader will assume it is a typo |
+| `pad_token_id` | int >= 0 or null | `null` | if `is_t5` | absent/null on an AR config: `.bin` streams are unpadded and the model substitutes torch's `ignore_index` sentinel |
+| `eos_token_id` | int >= 0 or null | `null` | if `is_t5` | |
+| `mask_token_start_id` | int >= 0 or null | `null` | if `is_t5` | first id of the sentinel range |
+
+**"required" means required in the FILE**, not required at read time -- `Hyperparameters`
+supplies a default for every key, so at read time they all exist. a key is required-in-file
+when letting it default would silently change what the run means, i.e. every knob that moves
+the numbers. `dim_head*headcount == dim` is the one cross-key invariant and is checked too.
+
+`validate_model_config()` reports **every** problem at once, not the first: fixing a config
+one exception at a time is how a config ends up half-migrated, which is worse than
+unmigrated because it looks done. it runs once, at startup, from `merge_config` -- it touches
+no tensor and no device and is nowhere near a forward pass.
+
+json has no comment syntax, so keys beginning with `_` (`_comment`, `_note`) are
+documentation: carried in the file, ignored by the schema, dropped by the merge, never seen
+by the model.
+
+a fork that adds a module with its own keys calls `extend_schema()` with its own `Key`
+entries rather than editing the table, exactly as `lint_attention_dtypes.py` takes an
+additional allowlist file.
+
+#### the two void-ablation configs
+
+`configs/ascii_eos_model.json` and `configs/ascii_eos_model_rollouttest.json` both declared
+`"attention_deux": false` and both got attention-II anyway, because the key was read by
+presence rather than by value. **the value stays `false`.** that is what the files always
+asked for and it is what makes the ablation an ablation; flipping them to `true` to match
+what the runs actually did would bake the bug in permanently and destroy the comparison. each
+file now carries a `_note` recording that any checkpoint bearing its `run_name` predates the
+fix, was trained with attention-II **ON**, and is therefore not comparable to a fresh run of
+the file.
+
+#### one key, one default
+
+`attention_deux` had **two** defaults: `Hyperparameters.model_config` said `True` while
+`pgptlformer`'s own `cfg_flag(..., default=False)` said `False`, so a config file that
+omitted the key got attention-II and a dict built in code did not. aligned to the model's
+`False`, which is the value that decides what actually gets constructed.
+`test_schema_defaults_match_the_loader_dataclass_defaults` now pins every key's default
+against the dataclass, so this cannot recur silently.
 
 ### Known-broken and left that way
 
