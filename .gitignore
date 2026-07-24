@@ -3,3 +3,9 @@ data/**
 __pycache__/**
 generated_audio/**
 project_outputs/**
+tencache/**
+.pytest_cache/**
+# checkpoints and sampled token tapes: generated artifacts, not source.
+*.pt
+# oops i packaged the peek log. never again.
+peek_log.txt

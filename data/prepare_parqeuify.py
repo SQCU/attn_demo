@@ -44,8 +44,11 @@ def write_datafile(filename, toks):
 
 # selection
 parser = argparse.ArgumentParser(description="modded_nanogpt dataset preprocessing")
-parser.add_argument("-t", "--trainfile", type=str, default="txt\TinyStoriesV2-GPT4-train.parquet", help="Which dataset to use for train.")
-parser.add_argument("-v", "--valfile", type=str, default="txt\TinyStoriesV2-GPT4-valid.parquet", help="Which dataset to use for train.")
+# these defaults were windows paths ("txt\...") written as non-raw strings, so python read
+# them as the invalid escapes \T / \T and left the backslash in. on the linux boxes this
+# actually runs on, that is one filename containing a backslash, not a directory. use /.
+parser.add_argument("-t", "--trainfile", type=str, default="txt/TinyStoriesV2-GPT4-train.parquet", help="Which dataset to use for train.")
+parser.add_argument("-v", "--valfile", type=str, default="txt/TinyStoriesV2-GPT4-valid.parquet", help="Which dataset to use for validation.")
 parser.add_argument("-s", "--shard_size", type=int, default=10**8, help="Size of each shard in tokens")
 parser.add_argument("-p", "--projectname", type=str, default="tinystories-pqt", help="what project we on?")
 args = parser.parse_args()

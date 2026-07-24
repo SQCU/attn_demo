@@ -524,7 +524,7 @@ if master_process:
     # create the log file
     if master_process and args.capture_rollouts_every > 0:
         print("Scroingling eval toingos. Kindly wait.")
-        # NOTE: You'll need a tokenizer instance. We'll use our ASCII one from sample-ascii.py
+        # NOTE: You'll need a tokenizer instance. We use the ASCII one from ascii_tokenizer.py
         # For a real run, this should be the same tokenizer used for training.
         from ascii_tokenizer import SimpleASCIITokenizer # Example, adjust as needed
         tokenizer = SimpleASCIITokenizer()

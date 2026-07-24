@@ -366,26 +366,11 @@ def scaled_dot_product_attn_bias(query, key, value, attn_mask=None, dropout_p=0.
     return attn_magnitude @ value
 
 ### states take format batch, sequence, embedding
-### therefore 
+### therefore
 ### batch_size, sequence_length, embedding_dim = h_states.shape
-def reshape_heads_dim(heads, tensor):
-    bat_len, seq_len, emb_dim = tensor.size()
-    head_len = heads
-    # i think equivalent to traditional
-    # "b n (h d) -> b h n d"
-    tensor = tensor.reshape(bat_len , seq_len, head_len, emb_dim // head_len)
-    tensor = tensor.permute(0, 2, 1, 3).reshape(bat_len*head_len, seq_len, emb_dim // head_len)
-    return tensor
-
-def reshape_dim_heads(heads, tensor):
-    bat_len, seq_len, emb_dim = tensor.size()
-    head_len = heads
-    # i think equivalent to traditional
-    # "b h n d -> b n (h d)"
-    tensor = tensor.reshape(bat_len // head_len, head_len, seq_len, emb_dim)
-    tensor = tensor.permute(0, 2, 1, 3).reshape(bat_len // head_len, seq_len, emb_dim*head_len)
-    return tensor
-
+### (reshape_heads_dim / reshape_dim_heads used to live here. every call site was replaced
+###  by an inline .view() years ago -- the modded-nanogpt roformer layout -- and the last
+###  references were commented out. deleted.)
 def create_attention_mask(padding_mask, is_causal):
     """
     Creates a boolean attention mask from a pre-computed padding mask.

@@ -7,7 +7,7 @@ import numpy
 import argparse
     
 ddir = os.path.dirname(__file__)
-tfile = r"txt\TinyStoriesV2-GPT4-valid.txt"
+tfile = "txt/TinyStoriesV2-GPT4-valid.txt"
 tprefix = str(os.path.splitext(tfile)[0])
 filename = os.path.join(ddir,tfile)
 
@@ -46,7 +46,15 @@ with open(filename, "w") as fille:
 """
 
 delimiter_r=r'\<\|endoftext\|\>'
-delimiter_regx = '/\<\|endoftext\|\>/gm'
+# heads up: this used to read '/\<\|endoftext\|\>/gm' -- that is a *javascript* regex
+# literal pasted into python. the wrapping slashes and the /gm flags are not python regex
+# syntax, so the pattern only ever matched the literal text "/<|endoftext|>/gm", which does
+# not occur in tinystories. read_csv therefore never split on it and handed back a single
+# column. that is exactly what the row-fold loop below wants (it finds delimiters itself via
+# df.isin), so the script has always worked -- by accident. keeping the never-matching
+# separator because the downstream logic depends on the one-column read, but saying so out
+# loud and as a raw string so it stops emitting invalid-escape warnings.
+delimiter_regx = r'/\<\|endoftext\|\>/gm'   # deliberately never matches: one-column read
 delimiter_literal = r'<|endoftext|>'
 
 """
