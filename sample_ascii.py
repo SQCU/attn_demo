@@ -9,6 +9,8 @@ import torch.nn as nn
 # --- MODIFIED: No more tiktoken! ---
 # import tiktoken 
 import pgptlformer
+from ascii_tokenizer import SimpleASCIITokenizer
+from sampler_utils import ar_sample
 
 # ---
 # --- CONFIGURATION ---
@@ -42,23 +44,13 @@ device_type = 'cuda' if 'cuda' in device else 'cpu'
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# --- NEW: Self-contained ASCII Tokenizer ---
-class SimpleASCIITokenizer:
-    """ A simple tokenizer for the first 256 ASCII characters. """
-    def __init__(self):
-        # We use range(256) to match the vocab_size from your training run
-        self.chars = [chr(i) for i in range(256)]
-        self.vocab_size = len(self.chars)
-        self.char_to_int = {ch: i for i, ch in enumerate(self.chars)}
-        self.int_to_char = {i: ch for i, ch in enumerate(self.chars)}
-
-    def encode(self, text):
-        """Converts a string to a list of integer token IDs."""
-        return [self.char_to_int.get(char, 0) for char in text]
-
-    def decode(self, tokens):
-        """Converts a list of integer token IDs back to a string."""
-        return "".join([self.int_to_char.get(token, '') for token in tokens])
+# the ASCII tokenizer used to be re-declared right here with range(256), while
+# ascii_tokenizer.py (which loader.py's rollout capture imports) declares range(128) and
+# data/prepare_ascii.py *emits* range(128). two tokenizers, one name, different vocabularies,
+# and the equality assert below hid it: configs declare vocab_size 256 because 2401.14489
+# wants vocab%64==0, not because there are 256 symbols. ids 128..255 are GEMM padding the
+# model can emit but the data never contains. one tokenizer now, and the assert checks what
+# it actually needs to check.
 
 # model loading
 ckpt_path = os.path.join(LOCAL_DIR, out_dir, checkpoint_name)
@@ -74,9 +66,10 @@ tformer_cfg = checkpoint['model_args']
 # --- MODIFIED: Instantiate our new tokenizer ---
 # Instead of tiktoken, we use our own.
 enc = SimpleASCIITokenizer()
-# We must ensure the loaded model's vocab size matches our tokenizer.
-assert tformer_cfg['vocab_size'] == enc.vocab_size, \
-    f"Vocab size mismatch! Model trained with {tformer_cfg['vocab_size']}, but tokenizer has {enc.vocab_size}."
+# the model's vocab must COVER the tokenizer's, not equal it: the extra ids are alignment
+# padding. an equality assert here is how the 128-vs-256 split went unnoticed.
+assert tformer_cfg['vocab_size'] >= enc.vocab_size, \
+    f"Vocab size mismatch! Model trained with {tformer_cfg['vocab_size']}, but tokenizer needs at least {enc.vocab_size}."
 encode = enc.encode
 decode = enc.decode
 
@@ -95,19 +88,10 @@ model.to(device)
 if torch_compile:
     model = torch.compile(model)
 
-# The sampling function `nlm_decode` remains COMPLETELY UNCHANGED as it's tokenizer-agnostic
-def nlm_decode(model, idx, max_new_tokens, max_seq, temperature=1.0, top_k=None):
-    for _ in range(max_new_tokens):
-        idx_cond = idx if idx.size(1) <= max_seq else idx[:, -max_seq:]
-        logits, _, _ = model(idx_cond, return_logits=True)
-        logits = logits[:, -1, :] / temperature
-        if top_k is not None:
-            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            logits[logits < v[:, [-1]]] = -float('Inf')
-        probs = nn.functional.softmax(logits, dim=-1)
-        idx_next = torch.multinomial(probs, num_samples=1)
-        idx = torch.cat((idx, idx_next), dim=1)
-    return idx
+# The sampling function is tokenizer-agnostic, so it is shared rather than copied.
+# (the local copy did `logits, _, _ = model(...)`: a 3-unpack of a 4-tuple. dead since
+#  forward_arg grew loss_per_sequence.)
+nlm_decode = ar_sample
 
 # Handle prompt from file or string
 if input_text.startswith('FILE:'):

@@ -1,14 +1,92 @@
 # t5_utils.py
 import numpy as np
 import torch
+
+
 class T5BatchProcessor:
-    def __init__(self, mask_token_start_id, pad_token_id, eos_token_id, vocab_size):
+    """turns a continuous token stream into a span-denoising (input, target) pair.
+
+    --- the EOS bug, and what replaced it --------------------------------------------------
+
+    the "fix special token masking" commit built the loss labels like this:
+
+        is_mask_token = (labels >= mask_token_start_id) & (labels < mask_token_start_id + 100)
+        is_eos_token  = (labels == eos_token_id)
+        labels[is_mask_token | is_eos_token] = pad_token_id     # -> skipped by ignore_index
+
+    so EOS was deleted from every target the model was ever trained on. the model was
+    therefore never once taught to emit EOS -- while sample_t5.py, sample_audio_t5.py,
+    sample_audio_t5_skipdecode.py and t5_service.py ALL terminate generation on EOS. every
+    one of them has only ever stopped by running out of max_new. a year of rollouts.
+
+    EOS is now in the loss. it is the single token the samplers depend on.
+
+    sentinels stay OUT of the loss by default, and that part was a deliberate and defensible
+    choice, not an accident: the k-th sentinel in a target stream is always
+    mask_token_start_id + k, a deterministic counter the model can produce with zero
+    information about the audio or the text. training on them buys nothing and it deflates
+    the reported loss by mixing in free tokens. set train_on_sentinels=True for the
+    T5-canonical treatment (original T5 trains on the full target including sentinels).
+
+    the range was also wrong. it hardcoded `mask_token_start_id + 100` -- "Assuming a maximum
+    of 100 sentinel tokens for masking" -- while _create_masked_sequence's own guardrail
+    allows `vocab_size - mask_token_start_id` of them, which is 1022 for the audio configs.
+    sentinels 100..1021 fell through the exclusion and WERE trained on, so the actual
+    behaviour was "sentinels are excluded, except the ones that aren't". the bound is now
+    derived from the same expression the masker uses -- see self.max_spans -- so the two
+    cannot drift apart again.
+    """
+
+    def __init__(self, mask_token_start_id, pad_token_id, eos_token_id, vocab_size,
+                 train_on_sentinels=False):
         self.mask_token_start_id = mask_token_start_id
         self.pad_token_id = pad_token_id
         self.eos_token_id = eos_token_id
         self.vocab_size = vocab_size
+        self.train_on_sentinels = train_on_sentinels
         # avg_span_length and mask_prob are now passed to __call__
         print("T5BatchProcessor initialized.")
+
+    @property
+    def max_spans(self):
+        """how many distinct sentinel ids exist. ONE definition, used by both the masker
+        (as its guardrail) and the loss-exclusion range."""
+        return self.vocab_size - self.mask_token_start_id
+
+    def build_labels(self, padded_targets):
+        """decoder targets -> loss labels, with excluded positions set to pad_token_id.
+
+        EOS survives. sentinels do not (unless train_on_sentinels). padding was already
+        pad_token_id and stays that way.
+        """
+        labels = padded_targets.clone()
+        if not self.train_on_sentinels:
+            is_sentinel = ((labels >= self.mask_token_start_id)
+                           & (labels < self.mask_token_start_id + self.max_spans))
+            labels[is_sentinel] = self.pad_token_id
+        return labels
+
+    def build_decoder_padding_mask(self, decoder_inputs):
+        """decoder inputs -> [B, T] visibility mask.
+
+        column 0 of decoder_inputs is the start-of-sequence slot, and this codebase spells
+        SOS as pad_token_id (there is no separate bos id). a bare
+        `(decoder_inputs != pad_token_id)` therefore marked position 0 INVISIBLE: not just
+        to itself -- with a causal mask, query row 0 could attend to nothing at all -- but
+        to every later query as well, since the padding mask gates KEY visibility for the
+        whole column. no decoder position could ever see the start of the sequence.
+
+        measured, not assumed: this does NOT produce NaN on torch 2.5.1. sdpa's safe-softmax
+        returns an all-zero row rather than 0/0, so the symptom was silent -- position 0's
+        self-attention output was exactly zero and BOS carried no signal anywhere. that is
+        the failure mode this repo specializes in: correct-looking numbers from a mechanism
+        that is not running.
+
+        column 0 is a real token. say so.
+        """
+        mask = (decoder_inputs != self.pad_token_id)
+        mask[:, 0] = True
+        return mask
 
     def __call__(self, batch_x, avg_span_length: int, mask_prob: float):
         # traditionally in t5 paper, avg_span_length:3, mask_prob = 0.15
@@ -36,20 +114,12 @@ class T5BatchProcessor:
         decoder_inputs = torch.roll(padded_targets, shifts=1, dims=1)
         decoder_inputs[:, 0] = self.pad_token_id
         # 3. Create the final labels tensor for the loss function.
-        #    Start with a copy and then replace all sentinel tokens with the pad_token_id.
-        labels = padded_targets.clone()
-        # A token is a sentinel if it's the EOS token OR if it's in the mask token range.
-        # Assuming a maximum of 100 sentinel tokens for masking.
-        is_mask_token = (labels >= self.mask_token_start_id) & (labels < self.mask_token_start_id + 100)
-        is_eos_token = (labels == self.eos_token_id)
-        # Create a combined mask for all tokens that should NOT contribute to the loss.
-        sentinel_mask = is_mask_token | is_eos_token
-        # Replace these tokens in the labels tensor with the pad_token_id.
-        # in normie-llm training code, we can't pass a loss mask without in-channel 'ignore-these' special values... :(
-        labels[sentinel_mask] = self.pad_token_id
+        # in normie-llm training code, we can't pass a loss mask without in-channel
+        # 'ignore-these' special values... :(
+        labels = self.build_labels(padded_targets)
         # 4. Create the attention masks based on the model inputs.
         encoder_padding_mask = (padded_inputs != self.pad_token_id)
-        decoder_padding_mask = (decoder_inputs != self.pad_token_id)
+        decoder_padding_mask = self.build_decoder_padding_mask(decoder_inputs)
         # 5. Return the final, cleaned labels.
         return padded_inputs, decoder_inputs, labels, encoder_padding_mask, decoder_padding_mask
 
@@ -76,20 +146,28 @@ class T5BatchProcessor:
             The usual batch tensors, PLUS a tensor of bucket indices for loss disaggregation.
         """
         B, T = batch_x.shape
-        
+
         # 1. Assign each example in the batch to a bucket based on the distribution
         bucket_indices = torch.multinomial(bucket_distribution, num_samples=B, replacement=True)
-        
+
+        # --- device-sync accounting ---
+        # this function is host-side by nature: numpy span sampling, python list building.
+        # it used to reach across the bus once PER SEQUENCE, twice over:
+        #     bucket_idx = bucket_indices[i].item()     # B transfers
+        #     sequence   = batch_x[i].tolist()          # B more, each of length T
+        # with device_batch_size=32 that is 64 pipeline drains per micro-step just to
+        # assemble a batch. one transfer each, up front, same values, same order.
+        bucket_index_list = bucket_indices.tolist()
+        batch_rows = batch_x.tolist()
+
         masked_inputs_list, raw_targets_list = [], []
 
         # 2. Process each example according to its assigned bucket
         for i in range(B):
-            bucket_idx = bucket_indices[i].item()
-            avg_span_length, mask_prob = sampler_ref.get_params_from_bucket(bucket_idx)
-            
-            sequence = batch_x[i].tolist()
-            input_seq, target_seq = self._create_masked_sequence(sequence, avg_span_length, mask_prob)
-            
+            avg_span_length, mask_prob = sampler_ref.get_params_from_bucket(bucket_index_list[i])
+
+            input_seq, target_seq = self._create_masked_sequence(batch_rows[i], avg_span_length, mask_prob)
+
             masked_inputs_list.append(torch.tensor(input_seq, dtype=torch.long))
             raw_targets_list.append(torch.tensor(target_seq, dtype=torch.long))
 
@@ -100,26 +178,27 @@ class T5BatchProcessor:
         padded_targets = torch.nn.utils.rnn.pad_sequence(
             raw_targets_list, batch_first=True, padding_value=self.pad_token_id
         )
-        # ... (the rest of the __call__ logic from the previous correct version) ...
+        # ... (the rest of the __call__ logic, and now it is literally the same code) ...
         decoder_inputs = torch.roll(padded_targets, shifts=1, dims=1)
         decoder_inputs[:, 0] = self.pad_token_id
-        labels = padded_targets.clone()
-        is_mask_token = (labels >= self.mask_token_start_id) & (labels < self.mask_token_start_id + 100)
-        is_eos_token = (labels == self.eos_token_id)
-        sentinel_mask = is_mask_token | is_eos_token
-        labels[sentinel_mask] = self.pad_token_id
+        labels = self.build_labels(padded_targets)
         encoder_padding_mask = (padded_inputs != self.pad_token_id)
-        decoder_padding_mask = (decoder_inputs != self.pad_token_id)
+        decoder_padding_mask = self.build_decoder_padding_mask(decoder_inputs)
 
-        return padded_inputs, decoder_inputs, labels, encoder_padding_mask, decoder_padding_mask, bucket_indices
+        # bucket_indices comes back as a HOST tensor built from the list we already
+        # transferred, so the trainer's curriculum bookkeeping needs no further sync.
+        return (padded_inputs, decoder_inputs, labels, encoder_padding_mask, decoder_padding_mask,
+                torch.tensor(bucket_index_list, dtype=torch.long))
 
 
     def _create_masked_sequence(self, tokens, avg_span_length, mask_prob):
-        mask_indices = np.random.permutation(len(tokens))
         num_to_mask = int(len(tokens) * mask_prob)
-        max_spans = (self.vocab_size - self.mask_token_start_id)
-        
+        max_spans = self.max_spans
+
         # Use np.random.permutation for efficiency
+        # (there used to be a second, identical permutation on the line above num_to_mask,
+        #  bound to `mask_indices` and immediately shadowed by this one. it consumed a draw
+        #  from the global numpy rng and was never read.)
         token_indices = np.random.permutation(len(tokens))
         
         masked_indices = set()
@@ -176,7 +255,10 @@ class T5BatchProcessor:
         
         return input_tokens, target_tokens
 
-from scipy.optimize import root_scalar # uv pip install scipy
+# scipy is imported inside _solve_for_lambda, not here. it is the single heaviest dependency
+# in this file and it is only needed by one method of one class, so a module-scope import
+# made T5BatchProcessor -- which needs nothing but numpy and torch -- untestable anywhere
+# scipy is missing. (uv pip install scipy, if you want the curriculum.)
 
 # ==============================================================================
 # == NEW: Adaptive Curriculum Sampler - The culmination of our design.
@@ -256,18 +338,25 @@ class AdaptiveCurriculumSampler:
     
     @torch.no_grad()
     def _solve_for_lambda(self, p_base: torch.Tensor, target_loss: float) -> float:
-        """Finds lambda to meet a target_loss constraint, using ema_losses as the hardness metric."""
+        """Finds lambda to meet a target_loss constraint, using ema_losses as the hardness metric.
+
+        this is a HOST-SIDE CONTROL LOOP. brentq is a scalar root find with data-dependent
+        iteration count; it cannot be made device-resident and there is no point pretending
+        otherwise. everything it touches (ema_losses, p_base) is deliberately kept on the cpu
+        for exactly this reason, so calling it costs no transfer at all. see loader.main().
+        """
+        from scipy.optimize import root_scalar # uv pip install scipy
         p_base_np = p_base.detach().cpu().numpy()
         # The empirical losses ARE the hardness values.
         hardness_values_np = self.ema_losses.detach().cpu().numpy()
         target_loss_np = target_loss
 
         def f(lam):
-            # A positive lambda should penalize HIGH loss (hard) tasks, so we use +lambda
-            exp_term = np.exp(lam * hardness_values_np)
             # We want to shift probability mass AWAY from P_base's low-loss preference
             # towards higher-loss tasks. A negative lambda will do this.
             # q_i = (1/Z) * p_i * exp(-lambda * H_i). If we want to upweight high H_i, lambda must be negative.
+            # (there was a first `exp_term = np.exp(+lam * H)` here, immediately overwritten
+            #  by the line below. leftover from working out the sign. deleted.)
             exp_term = np.exp(-lam * hardness_values_np)
             z = np.sum(p_base_np * exp_term)
             if z == 0: return np.inf
@@ -297,8 +386,9 @@ class AdaptiveCurriculumSampler:
         p_base = weights / torch.sum(weights)
 
         # Step 2: Determine the target loss from the current difficulty percentile
-        # Ensure losses are sorted for quantile calculation
-        sorted_losses, _ = torch.sort(self.ema_losses)
+        # (a `sorted_losses, _ = torch.sort(...)` lived here with the comment "Ensure losses
+        #  are sorted for quantile calculation". torch.quantile sorts internally; the result
+        #  was never read.)
         target_loss = torch.quantile(self.ema_losses, self.target_loss_percentile)
         
         # Step 3: Solve for the lambda that gets us from P_base's expected loss to the target_loss
@@ -329,17 +419,30 @@ class AdaptiveCurriculumSampler:
     # You can add a separate `sample` method if you ever need a single draw
     def sample(self) -> int:
         """Samples a single task bucket index from the current distribution."""
-        p_final = self.get_distribution()
-        return torch.multinomial(p_final, 1).item()
-        
-    def get_params_from_bucket(self, bucket_index: int) -> (int, float):
-        """Converts a bucket index into a concrete span length and mask probability."""
+        # this used to be `p_final = self.get_distribution()` -- get_distribution returns a
+        # DICT -- and then handed that dict straight to torch.multinomial. it has never been
+        # called, which is the only reason it has never raised. now it works.
+        return int(torch.multinomial(self.get_distribution()["p_final"], 1).item())
+
+    def get_params_from_bucket(self, bucket_index: int) -> "tuple[int, float]":
+        """Converts a bucket index into a concrete span length and mask probability.
+
+        bucket `i` covers span lengths [2^i, 2^(i+1)); one is drawn uniformly from that
+        range. mask_prob is held CONSTANT at base_mask_prob across every bucket.
+
+        the docstring used to claim this line "adjust[s] mask_prob to keep the total number
+        of masked tokens roughly constant". it does not, and it should not: mask_prob is
+        already the fraction of tokens masked, so holding it fixed is precisely what keeps
+        the masked-token budget constant while span length varies. the only thing that
+        changes across buckets is how that fixed budget is CHUNKED -- many short spans vs
+        few long ones -- which is the difficulty axis the curriculum is built on. the code
+        was right and the comment was describing a correction it did not need.
+        """
         min_len = int(2**bucket_index)
         max_len = int(2**(bucket_index + 1))
-        
+
         # Uniformly sample a span length from within the bucket's range
-        avg_span_length = np.random.randint(min_len, max_len)
-        # Adjust mask_prob to keep the total number of masked tokens roughly constant
+        avg_span_length = int(np.random.randint(min_len, max_len))
         mask_prob = self.base_mask_prob
 
         return avg_span_length, mask_prob

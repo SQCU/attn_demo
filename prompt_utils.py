@@ -5,7 +5,9 @@ import torch
 import random
 import os
 import numpy as np  # Added for AudioPromptGenerator
-import pandas as pd # uv pip install pandas pyarrow
+# pandas (uv pip install pandas pyarrow) is imported where it is used. it is only needed by
+# the two parquet readers below, and a module-scope import made loader.py -- which imports
+# this file -- unimportable anywhere pandas is missing.
 
 
 class PromptGenerator:
@@ -22,6 +24,7 @@ class PromptGenerator:
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"Source file not found at: {file_path}")
         if file_path.endswith('.parquet'):
+            import pandas as pd
             df = pd.read_parquet(file_path)
             # Assuming the text is in a column named 'text'
             if 'text' not in df.columns:
@@ -72,6 +75,7 @@ class AudioPromptGenerator:
         
         # 1. Load the small priority scores into memory
         print(f"  - Loading priority scores from: {parquet_path}")
+        import pandas as pd
         priority_df = pd.read_parquet(parquet_path)
         self.weights = torch.from_numpy(priority_df['priority_score'].values).float()
         
@@ -228,9 +232,9 @@ if __name__ == '__main__':
     print("== Self-Tests Complete ==")
     print("="*80)
 
-from encodec import EncodecModel
-from mformer_utils import tokenize_audio_on_the_fly, analyze_audio_on_the_fly
-from mformer_dataset import Hyperparameters # Import the config class
+# encodec / mformer_utils / mformer_dataset are imported inside OODAudioPromptGenerator,
+# which is the only thing in this file that uses them. at module scope they made
+# `import prompt_utils` -- and therefore `import loader` -- require the entire audio stack.
 
 class OODAudioPromptGenerator:
     """
@@ -250,6 +254,10 @@ class OODAudioPromptGenerator:
         print(f"--- Initializing OOD Audio Prompt Generator for: {ood_audio_path} ---")
         
         # 1. Instantiate analysis components
+        from encodec import EncodecModel
+        from mformer_utils import tokenize_audio_on_the_fly, analyze_audio_on_the_fly
+        from mformer_dataset import Hyperparameters # Import the config class
+
         params = Hyperparameters()
         encodec_model = EncodecModel.encodec_model_24khz().to(device)
         encodec_model.set_target_bandwidth(6.0) # Match training config

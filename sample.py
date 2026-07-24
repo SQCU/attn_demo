@@ -11,6 +11,7 @@ import torch.nn as nn
 import tiktoken
 #no gpt2s here haha
 import pgptlformer
+from sampler_utils import ar_sample
 
 #wacky env stuff:
 #import tritonpathsetter
@@ -88,27 +89,10 @@ encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
 decode = lambda l: enc.decode(l)
 
 #define sampler as external to model bc it really is yknow
-def nlm_decode(model, idx, max_new_tokens, max_seq, temperature=1.0, top_k=None):
-    
-    for _ in range(max_new_tokens):
-        # if the sequence context is growing too long we must crop it at max_seq
-        idx_cond = idx if idx.size(1) <= max_seq else idx[:, -max_seq:]
-        #forward requesting logits not loss:
-        logits, _, _z = model(idx_cond, return_logits=True)
-        # pluck the logits at the final step and scale by desired temperature
-        logits = logits[:, -1, :] / temperature
-        # optionally crop the logits to only the top k options
-        if top_k is not None:
-            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            logits[logits < v[:, [-1]]] = -float('Inf')
-        # apply softmax to convert logits to (normalized) probabilities
-        probs = nn.functional.softmax(logits, dim=-1)
-        # sample from the distribution
-        idx_next = torch.multinomial(probs, num_samples=1)
-        # append sampled index to the running sequence and continue
-        idx = torch.cat((idx, idx_next), dim=1)
-    
-    return idx
+#...and it now lives in exactly one place. this used to be a local copy doing
+#`logits, _, _z = model(...)` -- a 3-unpack of a 4-tuple, i.e. ValueError on the first
+#token, for as long as forward_arg has had loss_per_sequence. see sampler_utils.ar_sample.
+nlm_decode = ar_sample
 
 # encode the beginning of the prompt
 # the really weird overloading of text as a container for pathstrings is from nanogpt not me i promise.
