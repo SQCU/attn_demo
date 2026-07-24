@@ -1,0 +1,23 @@
+{
+  "_comment": "allowlist for lint_attention_dtypes.py. each entry is [file, scope, detail] -> the NUMERICAL justification for widening past the autocast dtype. entries are keyed by (file, scope, detail), so several identical casts inside one function share one entry -- which is correct, because they are one decision, and the comment names every site it covers. this file ships with the lint; a fork that adds another attention module ships an ADDITIONAL json and passes both to --allowlists rather than editing this one.",
+  "entries": [
+    [
+      "pgptlformer.py",
+      "rotarizer.__init__",
+      ".float()",
+      "rotary inv_freq = base**(-arange(0,dim,2)/dim), evaluated fp32 at construction and stored bf16. runs once, never on a training step, and is not an activation. at dim_head=64 and base=1000 the smallest inv_freq is 1000**(-62/64) = 1.4e-3; evaluating that power in bf16 (8 mantissa bits, 3.9e-3 relative) perturbs the longest-period rotary channel by ~0.4% of its own frequency, and the phase error accumulates linearly over the 512-token training window."
+    ],
+    [
+      "pgptlformer.py",
+      "PGPT_Lformer.forward_arg",
+      ".float()",
+      "logits.float() before cross_entropy, at both sites in this function (the targets branch and the last-position sampling branch). logits are tanh-clamped to +-30, where bf16's 8 mantissa bits give an absolute resolution of 30*2^-8 = 0.117, against a cross-entropy that lives in the 1-10 nat range -- so the log-sum-exp over vocab_size=256..50304 would carry up to ~0.12 nats of pure quantization error, 1-10% of the quantity being optimized, and the gradient inherits it. fp32's 24 mantissa bits resolve the same value to 1.8e-6."
+    ],
+    [
+      "pgptlformer.py",
+      "PGPT_Lformer.forward_t5",
+      ".float()",
+      "the same cast at both sites of the t5 path, for the same arithmetic: 0.117 absolute bf16 resolution at the +-30 tanh clamp versus 1.8e-6 in fp32, over a 1-10 nat objective. it must ALSO match forward_arg's precision exactly, or an AR-vs-t5 loss comparison measures the cast rather than the architecture."
+    ]
+  ]
+}

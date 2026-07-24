@@ -135,6 +135,11 @@ body lives in `main()`), and everything below runs on cpu in a few seconds.
   assertion: dynamo raises rather than silently falling back, so a graph break in a new knob
   fails the suite. backend is `eager`, because what is under test is the trace, not codegen
   -- inductor needs a c++ toolchain and this has to run on a laptop.
+- `test_flex_masks.py` -- 37 tests over `flex_masks.py`, each one asserting one of the two
+  safety directions of the block-mask contract against a dense reference built *in the
+  test* at tiny shapes. see "BLOCK MASKS FROM BOUNDS" below.
+- `test_lints.py` -- the two lints, each with a planted violation, because a lint that
+  finds nothing because it is broken passes every test ever written.
 
 ## Data Flow & Project Workflows
 
@@ -447,6 +452,117 @@ the treatment now:
   `(decoder_input_ids != pad_token_id)` marked the whole first **column** invisible: nothing
   could attend to the start of the sequence. it did not NaN (torch 2.5.1's safe-softmax
   returns an all-zero row), it just silently contributed nothing.
+
+### BLOCK MASKS FROM BOUNDS
+
+`flex_masks.py` builds `flex_attention` `BlockMask`es from cheap conservative bounds,
+without ever materializing a dense `[B, H, Q, KV]` mask. it knows nothing about any model:
+it is about mask STRUCTURE -- prefix bounds, sliding windows, block-diagonal groups, and
+their unions, intersections and key-space concatenations. those are the shapes that show up
+in padded batching, packed multi-user prefill, prefix-bidirectional attention,
+sliding-window attention and grouped/block-parallel decoding alike.
+
+#### the contract: full is a SUBSET, partial is a SUPERSET
+
+this is the whole reason the module can be cheap and still be correct. a `BlockMask` carries
+two block lists and **they have opposite safety directions**:
+
+| list | requirement | what happens if you get it wrong |
+| --- | --- | --- |
+| `full_kv_num_blocks` / `full_kv_indices` | must be a **SUBSET** of the truly-all-allowed blocks | flex **skips `mask_mod` entirely** inside a full block, so over-claiming FULL silently attends forbidden keys. this is the unsafe direction. |
+| `kv_num_blocks` / `kv_indices` (partial) | must be a **SUPERSET** of every block containing any allowed element | flex evaluates `mask_mod` inside these, so an over-listed block costs kernel time and nothing else. under-claiming silently drops attention. |
+
+the corollary is the thing worth remembering:
+
+> **demoting a would-be-full block to partial is always safe.** it costs speed, never
+> correctness, because `mask_mod` runs inside it and filters exactly.
+
+so a builder does not need exact block occupancy. it needs a cheap LOWER bound on full and a
+cheap UPPER bound on live, and the `mask_mod` -- which runs in-kernel, on registers, and
+never touches HBM -- makes up the difference. that is what lets every function in the module
+be `O(n_q_blocks * n_kv_blocks)` instead of `O(Q * KV)`.
+
+two consequences that look like bugs and are not:
+
+- a **sliding window** claims no full blocks by default. a kv block is all-allowed only if
+  it sits inside *every* query's window, which needs `window >= block + (hi - lo)`; with the
+  usual `window < block` that is impossible. pass `allow_full=True` with `key_all` when you
+  genuinely have wide windows.
+- the per-q-block union of windows is **not contiguous** once the bounds inside a block are
+  spaced further apart than the window. the convex hull `[lo - window + 1, hi]` over-lists,
+  and that is legal: a superset is exactly what partial must be.
+  `test_gapped_window_union_is_a_legal_superset_not_a_bug` asserts the gaps are real, the
+  hull covers them, and the reconstruction is still exact.
+
+#### why this is not optional: the traffic
+
+the obvious way to derive block occupancy is `any()`/`all()` over a materialized dense mask.
+exact, structurally impossible to get wrong -- and bandwidth-pessimized in precisely the way
+`flex_attention` exists to avoid. at a representative training shape (B=128, H=12, Q=640,
+KV=512, BLOCK=128):
+
+| description | elements | bytes |
+| --- | --- | --- |
+| dense `[B, H, Q, KV]` bool mask | 128 x 12 x 640 x 512 = **503,316,480** | **503.3 MB** |
+| block occupancy, H=1 (partial + full bools) | 2 x 128 x 5 x 4 = **5,120** | 5.1 KB |
+| the int32 CSR flex actually consumes (both orientations, partial + full) | | 50.2 KB |
+| **block total** | | **55.3 KB** |
+
+**9,102x**, per layer, per step. against the occupancy alone the ratio is the asymptotic
+`BLOCK^2 * H / 2 = 128*128*12/2 = 98,304`; the CSR is what costs the rest. masks are built
+with `H=1` and broadcast across heads, because every pattern in the module is a function of
+(batch, query position, key position) only.
+
+`mask_traffic_report()` computes those numbers rather than asserting them by hand, and
+`test_mask_traffic_report_matches_the_readme_arithmetic` pins this table.
+
+#### enforcement
+
+- `lint_mask_traffic.py` bans dense-mask materialization two ways, because neither alone is
+  sufficient. **statically**, an AST pass flags `create_block_mask` / `create_mask` /
+  `_ordered_to_dense` and any `mask_mod` that subscripts a tensor with both a query and a key
+  index; it is cheap and it cannot see through helper functions. **dynamically**,
+  `AllocationAudit` is a `TorchFunctionMode` that watches every tensor produced inside a
+  block and fails the moment anything `Q*KV`-shaped appears, no matter how it was spelled.
+- `lint_attention_dtypes.py` is an AST pass over dtype-widening sites on the attention path,
+  checked against `lint_allowlist_attention_dtypes.json` -- a data file in which every entry
+  carries a **numerical** justification. a new widening site with no recorded reason fails
+  the suite. it is a static pass and not a runtime assertion on purpose: a runtime dtype
+  check would cost a graph break and a device sync on every step of every run forever, to
+  catch a mistake that is made in the source at edit time.
+
+both lints take their file set and allowlist set as parameters and run standalone:
+
+```
+uv run python lint_mask_traffic.py
+uv run python lint_attention_dtypes.py
+```
+
+#### `BlockMask` is constructed directly
+
+not via `create_block_mask` (it evaluates `mask_mod` over the whole `Q*KV` grid, and is not
+dynamo-traceable in torch 2.5.1 -- `inspect.signature`) and not via
+`BlockMask.from_kv_blocks` (which round-trips the CSR back through a block-level dense tensor
+via `_ordered_to_dense` purely to transpose it, and runs per-call validation -- by the same
+rule that keeps checks out of hot paths, that validation belongs in the equivalence test).
+the q-orientation lists flex's backward needs are the packing of the transposed occupancy,
+asserted bit-identical to torch's `_transpose_ordered`. measured on torch 2.5.1, building a
+`BlockMask` this way inside a `torch.compile` region produces **zero dynamo graph breaks**,
+so the mask build does not need an eager island at all.
+
+#### the obvious next step, deliberately not taken
+
+**the T5 encoder and decoder still build their padding and causal masks densely, and they
+should not.** both are pure block structure -- a padding mask is `key_block_validity()`, a
+causal mask is `prefix_blocks()` with `bound = q_idx`, and encoder-decoder cross-attention is
+`prefix_blocks()` with an unbounded prefix -- so the whole family is expressible in the
+primitives above with no new mechanism.
+
+it is not done here. moving the model's attention onto `flex_attention` changes the numerics
+(a different kernel, a different reduction order), changes the compile surface, and needs its
+own before/after on real checkpoints. that is a reviewed piece of work of its own, not a
+rider on the module that makes it possible. `flex_masks.py` ships tested and unused by the
+model, which is the honest state of it.
 
 ### Known-broken and left that way
 
