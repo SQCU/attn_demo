@@ -99,6 +99,38 @@ You can generate text from your trained model using `sample.py`.
 
 You will need to edit the simplistic hardcoded checkpoint path in `sample.py` to match your trained `pgpt_lformer` checkpoint. Edit the `prompt.txt` file to change the sampling cue. `sample.py` is more of an existence proof than a tool; if you can read this sentence, you can write a better one!
 
+### Running the tests
+
+```
+uv run python -m pytest tests -q
+```
+
+there are tests now. this repo's recurring failure has never been the mechanism -- the
+mechanisms are ambitious and mostly correct -- it is the **instrument**: something reading
+the mechanism that was itself never checked. a presence test standing in for a value test,
+a 3-unpack of a 4-tuple, a loss that deletes the token every sampler stops on, a pair of
+transposes around a no-op. all of it survived because nothing in this repo could be imported
+without a gpu, let alone run.
+
+so: `loader.py`, `prompt_utils.py`, `t5_utils.py` and `sampler_utils.py` are now importable
+on a laptop (heavy and cuda-only imports moved to their point of use; the training script
+body lives in `main()`), and everything below runs on cpu in a few seconds.
+
+- `test_forward_paths.py` -- every forward path x arity x z-loss x attention-II, plus a
+  short real sampling loop, plus a model deliberately returning a **five**-tuple to prove
+  the call sites cannot break that way again.
+- `test_config_gating.py` -- every knob read by value; `"attention_deux": false` disables it;
+  malformed and partial configs fail loudly; every shipped config in `configs/` builds.
+- `test_model_internals.py` -- norms and scales against reference implementations.
+- `test_attention_gate.py` -- gate-off bit-identity, gate-on init behaviour, gate coverage
+  across all four attention schemas.
+- `test_attention_ii_scaling.py` -- the S-scaling result, asserted.
+- `test_t5_batch_processor.py` -- EOS survives into the loss and moves the number.
+- `test_training_semantics.py` -- gradient accumulation semantics, the ddp micro-step fix,
+  and the device-sync lint (which is itself tested against a planted offender).
+- `test_audio_branch.py` -- the shared decode loop at batch 1 and batch 2, sync counts, and
+  ast-level checks over the modules that need the audio stack to import.
+
 ## Data Flow & Project Workflows
 
 Understanding the flow of data from raw files to model outputs is key. Below are the primary workflows supported by this project.
@@ -383,6 +415,45 @@ rerunning something.
   architecture exists to avoid. it carried zero parameters under every config in `configs/`
   (`layerwisenorm: rmsnorm` -> `elementwise_affine=False`), so no shipped `state_dict` key
   changes; there is a test for that.
+
+### The T5 target stream: what is in the loss
+
+`T5BatchProcessor` used to build the loss labels by overwriting **sentinels and EOS** with
+`pad_token_id` so `ignore_index` would skip them. the consequence is worth stating plainly:
+**the model was never trained to emit EOS**, and every sampler in this repo -- `sample_t5.py`,
+`sample_audio_t5.py`, `sample_audio_t5_skipdecode.py`, `t5_service.py` -- terminates on EOS.
+generation could only ever stop by exhausting `max_new`, and has for a year. the sampler was
+reading a stop signal the trainer had removed.
+
+the treatment now:
+
+- **EOS is in the loss.** it is the one token the samplers depend on.
+- **sentinels are out of the loss, by default and on purpose.** the k-th sentinel in a target
+  stream is always `mask_token_start_id + k` -- a deterministic counter carrying no
+  information about the data. training on it buys nothing and deflates the reported loss by
+  padding it with free tokens. `T5BatchProcessor(train_on_sentinels=True)` gives the
+  T5-canonical treatment (original T5 trains on the whole target) if you want to ablate it.
+- **the range is derived, not hardcoded.** it used to be `mask_token_start_id + 100`, while
+  the masker's own guardrail permits `vocab_size - mask_token_start_id` sentinels -- 1022 for
+  the audio configs. sentinels 100..1021 fell through and *were* trained on, so the real
+  policy was "sentinels are excluded, except the ones that aren't", which is worse than
+  either policy. one definition (`max_spans`) now serves both.
+- the decoder's start-of-sequence slot is spelled with `pad_token_id`, so
+  `(decoder_input_ids != pad_token_id)` marked the whole first **column** invisible: nothing
+  could attend to the start of the sequence. it did not NaN (torch 2.5.1's safe-softmax
+  returns an all-zero row), it just silently contributed nothing.
+
+### Known-broken and left that way
+
+`sample_audio_t5_skipdecode.py` is a janky mess and the author says so. it has not been
+rewritten. one live `KeyError` in its fallback path was guarded, and that is all.
+
+its nearest-neighbour matcher takes the **cosine similarity between sequences of integer
+token IDs**, zero-padded to a common length. that is not a distance between sounds. encodec
+codebook indices are categorical labels; index 300 is not "closer" to index 301 than to index
+7, and their dot product means nothing. the mechanism is conceptually empty and no amount of
+fixing the code around it changes that. it is written down here rather than repaired, because
+repairing it means designing a real acoustic distance, and that is a different piece of work.
 
 ### Device-host synchronization: the inventory
 

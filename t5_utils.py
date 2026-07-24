@@ -123,15 +123,10 @@ class T5BatchProcessor:
         # 5. Return the final, cleaned labels.
         return padded_inputs, decoder_inputs, labels, encoder_padding_mask, decoder_padding_mask
 
-        """# In your training loop:
-        logits, _, _ = model(...)
-        loss_fct = nn.CrossEntropyLoss(reduction='none') # IMPORTANT: get per-token loss
-        loss = loss_fct(logits.view(-1, logits.size(-1)), padded_labels.view(-1))
-        loss = loss.view_as(padded_labels) # Reshape back to [B, T]
-
-        # Apply the mask and get the correct mean
-        masked_loss = loss * loss_mask
-        final_loss = masked_loss.sum() / loss_mask.sum() # Average by number of REAL tokens"""
+    # (an unreachable string literal after that return used to hold a "# In your training
+    #  loop:" snippet. it was worse than dead -- it TAUGHT `logits, _, _ = model(...)`, the
+    #  3-unpack that killed all three samplers, and it referenced a `loss_mask` this API has
+    #  never returned. deleted. the live version is loader.main(), which unpacks by index.)
 
     def create_curriculum_batch(self, batch_x: torch.Tensor, bucket_distribution: torch.Tensor, sampler_ref):
         """
