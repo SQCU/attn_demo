@@ -245,7 +245,8 @@ def calculate_features_from_audio(audio_path: str, tokens_shape, frame_rate: flo
 # =============================================================================
 class StructuralAnalyzer:
     """Analyzes a feature time series to produce a sampling priority score."""
-    def __init__(self, features, frame_rate: float, chunk_size_tokens: int, params: Hyperparameters, novelty_mode: str = "crossover", stability_mode = "local", ema_span_chunks = 3, blur_sigma = 0.0):
+    def __init__(self, features, frame_rate: float, chunk_size_tokens: int, params: Hyperparameters, novelty_mode: str = "crossover", stability_mode = "local", ema_span_chunks = 3, blur_sigma = 0.0,
+                 novelty_window_size: int = 3, pred_window_size: int = 15, pred_lag: int = 15):
         self.features = features
         self.w_novelty = 0.7
         self.w_instability = 0.3
@@ -253,6 +254,15 @@ class StructuralAnalyzer:
         self.stability_mode = stability_mode
         self.ema_span_chunks = ema_span_chunks
         self.blur_sigma = blur_sigma
+        # _compute_predictive_stability and _compute_vector_novelty_activity used to read
+        # the module-level `args` GLOBAL from inside these methods. that only exists when
+        # this file is run as __main__, so both methods raised NameError on any import --
+        # and this class IS imported (mformer_utils.analyze_audio_on_the_fly, which
+        # prompt_utils' OOD generator drives). parameters now, defaults matching the
+        # argparse defaults below.
+        self.novelty_window_size = novelty_window_size
+        self.pred_window_size = pred_window_size
+        self.pred_lag = pred_lag
 
         # --- NEW: Convert time-based params to chunk-based params ---
         chunks_per_second = frame_rate / chunk_size_tokens
@@ -284,9 +294,9 @@ class StructuralAnalyzer:
         """
         print("  Computing stability using 'predictive' mode (Sliding Window Correlation)...")
         
-        radius = args.pred_window_size # e.g., 3
+        radius = self.pred_window_size # e.g., 3
         window_len = 2 * radius + 1   # e.g., 7
-        lag = args.pred_lag           # e.g., 5
+        lag = self.pred_lag           # e.g., 5
         
         num_chunks, _ = velocity_vectors.shape
         predictive_stability = np.zeros(num_chunks)
@@ -354,11 +364,11 @@ class StructuralAnalyzer:
         Calculates novelty based on the local variance (activity) of the
         feature vectors within a sliding window.
         """
-        print(f"  Computing novelty using 'activity' mode with window size: {args.novelty_window_size}...")
-        
+        print(f"  Computing novelty using 'activity' mode with window size: {self.novelty_window_size}...")
+
         # Use pandas rolling window functionality for efficiency
         df = pd.DataFrame(self.features)
-        window_size = args.novelty_window_size
+        window_size = self.novelty_window_size
 
         # Calculate the rolling variance for each feature column
         # .rolling() is centered by default, which is perfect.
@@ -380,18 +390,26 @@ class StructuralAnalyzer:
         """Runs the full analysis pipeline."""
         print("PHASE 2: Generating structural signals...")
         # NEW: Select novelty calculation based on the mode.
+        # v_vecs is only produced by the velocity mode, which is the only mode the
+        # predictive stability path can run on top of.
+        v_vecs = None
         if self.novelty_mode == 'activity':
             novelty = self._compute_vector_novelty_activity()
         elif self.novelty_mode == 'velocity':
-            novelty = self._compute_vector_novelty_velocity()
+            # this used to be `novelty = self._compute_vector_novelty_velocity()`, binding
+            # the whole (novelty, velocity_vectors) TUPLE to `novelty`, and then analyze()
+            # went on to reference a `v_vecs` that was never defined anywhere in the file.
+            # so --novelty_mode velocity was broken, and --stability_mode predictive, which
+            # requires it, was broken twice.
+            novelty, v_vecs = self._compute_vector_novelty_velocity()
         elif self.novelty_mode == 'crossover':
             novelty = self._compute_vector_novelty_crossover()
         else:
-            raise ValueError(f"Unknown novelty_mode: {self.novelty_mode}")
-        
+            raise ValueError(f"Unknown novelty_mode: {self.novelty_mode}. Expected one of: activity, velocity, crossover")
+
         if self.stability_mode == 'predictive':
             # This requires the velocity vectors, so we must be in velocity novelty mode
-            if self.novelty_mode != 'velocity':
+            if v_vecs is None:
                 raise ValueError("'predictive' stability mode requires 'velocity' novelty mode.")
             stability = self._compute_predictive_stability(v_vecs)
             
@@ -549,7 +567,8 @@ if __name__ == '__main__':
         "--novelty_mode",
         type=str,
         default="crossover",
-        help="crossover|velocity"
+        choices=("crossover", "velocity", "activity"),
+        help="crossover|velocity|activity  ('activity' was implemented and omitted here)"
     )
     parser.add_argument(
         "--novelty_window_size",
@@ -567,7 +586,9 @@ if __name__ == '__main__':
         "--stability_mode",
         type=str,
         default="local",
-        help="local|predictive|activity"
+        choices=("local", "predictive"),
+        help="local|predictive  ('activity' used to be listed here; it is a NOVELTY mode, "
+             "not a stability mode, and passing it just fell through to 'local')"
     )
     parser.add_argument(
         "--pred_window_size",
@@ -613,7 +634,11 @@ if __name__ == '__main__':
         features, tokens_for_loader, frame_rate = generate_mock_data(chunk_size_tokens=chunk_size_tokens)
     
     # --- PHASE 2 ---
-    analyzer = StructuralAnalyzer(features, frame_rate, chunk_size_tokens, params, novelty_mode=args.novelty_mode, stability_mode=args.stability_mode, ema_span_chunks=args.ema_span_chunks, blur_sigma=args.blur_sigma)
+    analyzer = StructuralAnalyzer(features, frame_rate, chunk_size_tokens, params,
+                                  novelty_mode=args.novelty_mode, stability_mode=args.stability_mode,
+                                  ema_span_chunks=args.ema_span_chunks, blur_sigma=args.blur_sigma,
+                                  novelty_window_size=args.novelty_window_size,
+                                  pred_window_size=args.pred_window_size, pred_lag=args.pred_lag)
     priority_scores, stability, novelty = analyzer.analyze()
     
     # --- File Naming and Saving ---

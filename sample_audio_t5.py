@@ -26,6 +26,7 @@ import pgptlformer
 import argparse
 from tqdm import tqdm
 from prompt_utils import AudioPromptGenerator, OODAudioPromptGenerator
+from sampler_utils import t5_decode, trim_at_eos
 from datetime import datetime
 import random
 
@@ -114,101 +115,10 @@ seed_prompts = prompt_generator.get_prompts(
     prompt_length=args.prompt_length
 ).to(args.device)
 
-# --- Fully Batched T5 Decode Function ---
-def t5_decode_fully_batched(model, encoder_input_ids, max_new, temp, top_k):
-    pad_id, eos_id = model_config['pad_token_id'], model_config['eos_token_id']
-    batch_size = encoder_input_ids.shape[0]
-    
-    decoder_input_ids = torch.full((batch_size, 1), pad_id, dtype=torch.long, device=args.device)
-    encoder_padding_mask = (encoder_input_ids != pad_id)
-    encoder_hidden_states = model.encode(encoder_input_ids, encoder_padding_mask)
-    
-    # This mask tracks which sequences in the batch have finished
-    has_finished = torch.zeros(batch_size, dtype=torch.bool, device=args.device)
-
-    for _ in range(max_new):
-        logits = model.decode_step(decoder_input_ids, encoder_hidden_states, encoder_padding_mask)
-        logits = logits[:, -1, :] / temp
-        
-        if top_k is not None:
-            k = min(top_k, logits.size(-1))
-            v, _ = torch.topk(logits, k)
-            threshold = v[:, -1].unsqueeze(-1)
-            logits[logits < threshold] = -float('Inf')
-            
-        probs = nn.functional.softmax(logits, dim=-1)
-        idx_next = torch.multinomial(probs, num_samples=1)
-        
-        # For sequences that have already finished, append padding instead of new tokens
-        idx_next[has_finished] = pad_id
-        # Update the finished mask for any sequences that just generated EOS
-        has_finished |= (idx_next.squeeze() == eos_id)
-        
-        decoder_input_ids = torch.cat((decoder_input_ids, idx_next), dim=1)
-        
-        # If all sequences in the batch are done, we can exit early
-        if has_finished.all():
-            break
-            
-    return decoder_input_ids[:, 1:]
-
-# --- NEW: T5 IN-FILLING DECODE FUNCTION ---
-def t5_infill_batched(model, prefix_ids, postfix_ids, max_new, temp, top_k):
-    """
-    Performs batched in-filling using the T5 architecture.
-    """
-    pad_id = model_config['pad_token_id']
-    eos_id = model_config['eos_token_id']
-    mask_id = model_config['mask_token_start_id']
-    batch_size = prefix_ids.shape[0]
-    device = prefix_ids.device
-
-    # 1. Construct the encoder input: [prefix, <mask_0>, postfix]
-    mask_token = torch.full((batch_size, 1), mask_id, dtype=torch.long, device=device)
-    encoder_input_ids = torch.cat([prefix_ids, mask_token, postfix_ids], dim=1)
-    
-    # The rest of the generation logic is identical to continuation
-    encoder_padding_mask = (encoder_input_ids != pad_id)
-    encoder_hidden_states = model.encode(encoder_input_ids, encoder_padding_mask)
-    
-    # The decoder starts by being prompted with what to fill in: <mask_0>
-    decoder_input_ids = torch.full((batch_size, 1), mask_id, dtype=torch.long, device=device)
-    
-    has_finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-
-    for _ in range(max_new):
-        logits = model.decode_step(decoder_input_ids, encoder_hidden_states, encoder_padding_mask)
-        logits = logits[:, -1, :] / temp
-        
-        if top_k is not None:
-            k = min(top_k, logits.size(-1))
-            v, _ = torch.topk(logits, k)
-            threshold = v[:, -1].unsqueeze(-1)
-            logits[logits < threshold] = -float('Inf')
-            
-        probs = nn.functional.softmax(logits, dim=-1)
-        idx_next = torch.multinomial(probs, num_samples=1)
-        
-        idx_next[has_finished] = pad_id
-        has_finished |= (idx_next.squeeze() == eos_id)
-        
-        decoder_input_ids = torch.cat((decoder_input_ids, idx_next), dim=1)
-        
-        if has_finished.all():
-            break
-            
-    # 2. Post-process: remove the initial <mask_0> and any <eos>/padding
-    output_sequences = []
-    for i in range(batch_size):
-        # Slice off the starting <mask_0> token
-        seq = decoder_input_ids[i, 1:]
-        # Find the first EOS token
-        eos_idx = (seq == eos_id).nonzero(as_tuple=True)[0]
-        if len(eos_idx) > 0:
-            seq = seq[:eos_idx[0]]
-        output_sequences.append(seq)
-        
-    return output_sequences
+# (t5_decode_fully_batched and t5_infill_batched lived here: ~95 lines, two complete
+#  copies of the decode loop, both superseded by _t5_decoder_engine below and neither called
+#  from anywhere. deleted. the surviving loop now delegates to sampler_utils.t5_decode, so
+#  there is exactly one of these in the repo.)
 
 # --- NEW: High-Level Continuation Wrapper ---
 def t5_continue_step(model, context, max_new, temp, top_k):
@@ -250,48 +160,21 @@ def _t5_decoder_engine(model, encoder_input_ids, max_new, temp, top_k):
     The low-level decoder engine. Takes a pre-formatted encoder input
     and generates the corresponding sequence. This is the unified backend
     for both continuation and in-filling.
+
+    the loop itself is sampler_utils.t5_decode: ONE implementation, with the bare
+    .squeeze() (broken at batch_size 1) and the per-token has_finished.all() host sync
+    fixed in one place instead of five.
     """
     pad_id = model_config['pad_token_id']
     eos_id = model_config['eos_token_id']
     mask_id = model_config['mask_token_start_id']
-    batch_size = encoder_input_ids.shape[0]
-    device = encoder_input_ids.device
-    
-    encoder_padding_mask = (encoder_input_ids != pad_id)
-    encoder_hidden_states = model.encode(encoder_input_ids, encoder_padding_mask)
-    
-    # The decoder always starts by being prompted with <mask_0>
-    decoder_input_ids = torch.full((batch_size, 1), mask_id, dtype=torch.long, device=device)
-    has_finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-    for _ in range(max_new):
-        logits = model.decode_step(decoder_input_ids, encoder_hidden_states, encoder_padding_mask)
-        logits = logits[:, -1, :] / temp
-        
-        if top_k is not None:
-            k = min(top_k, logits.size(-1))
-            v, _ = torch.topk(logits, k)
-            logits[logits < v[:, [-1]]] = -float('Inf')
-            
-        probs = nn.functional.softmax(logits, dim=-1)
-        idx_next = torch.multinomial(probs, num_samples=1)
-        
-        idx_next[has_finished] = pad_id
-        has_finished |= (idx_next.squeeze() == eos_id)
-        decoder_input_ids = torch.cat((decoder_input_ids, idx_next), dim=1)
-        if has_finished.all():
-            break
-            
+    tape = t5_decode(model, encoder_input_ids, max_new,
+                     pad_id=pad_id, eos_id=eos_id,
+                     decoder_start_id=mask_id,   # the decoder is prompted with <mask_0>
+                     temperature=temp, top_k=top_k)
     # Post-process: return a list of clean tensors (variable length)
-    output_sequences = []
-    for i in range(batch_size):
-        seq = decoder_input_ids[i, 1:] # Slice off the starting <mask_0>
-        eos_idx = (seq == eos_id).nonzero(as_tuple=True)[0]
-        if len(eos_idx) > 0:
-            seq = seq[:eos_idx[0]]
-        output_sequences.append(seq)
-        
-    return output_sequences
+    return trim_at_eos(tape, eos_id)
 
 # --- Main PARALLEL Long-Form Generation Loop ---
 print(f"\n--- Generating {args.num_samples} long-form samples in parallel over {args.num_iterations} iterations ---")
@@ -355,7 +238,13 @@ final_long_sequences = current_sequences
 # --- STAGE 3: UNIFIED SAVING ---
 # Determine filename based on initialization mode
 suffix = "infilled_rollout" if args.infill else "continued_rollout"
-output_filename = f"tencache\{output_filename_stem}_{suffix}.pt"
+# this used to be f"tencache\{stem}_{suffix}.pt". `\{` is not an escape sequence, so python
+# kept the backslash: on macos and linux that writes ONE file into the cwd whose name
+# literally begins "tencache\", rather than a file inside a tencache/ directory. and the
+# directory was never created either way.
+TENCACHE_DIR = "tencache"
+os.makedirs(TENCACHE_DIR, exist_ok=True)
+output_filename = os.path.join(TENCACHE_DIR, f"{output_filename_stem}_{suffix}.pt")
 
 print(f"\nSaving generated token sequences to: {output_filename}")
 torch.save({

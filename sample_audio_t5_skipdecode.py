@@ -137,15 +137,28 @@ class GreedySkipDecoder:
                 
                 # --- HEURISTIC FALLBACK LOGIC ---
                 best_match_seq = self._find_best_match(query_sequence)
-                
-                fused_id = self.seq_to_id[best_match_seq]
-                length = len(best_match_seq)
-                
-                original_token_start_idx = random.choice(self.bpe_index[fused_id])
-                start_sample = int(original_token_start_idx * self.samples_per_token)
-                end_sample = int((original_token_start_idx + length) * self.samples_per_token)
-                audio_chunk = self.wav[:, start_sample:end_sample].clone()
-                
+
+                # the exact-match branch above guards with
+                #   `if fused_id in self.bpe_index and len(self.bpe_index[fused_id]) > 0`
+                # and this branch did not, so a bpe word present in seq_to_id but absent
+                # from (or empty in) bpe_index was a KeyError / IndexError straight out of
+                # the decode loop. not hypothetical: the two dicts are built from different
+                # passes over the corpus. same guard, and if it fails we emit silence for
+                # the query window and keep going rather than taking the whole run down.
+                # NOT touching the rest of this file -- it is a janky mess by the author's
+                # own account and it is left as-is on purpose.
+                fused_id = self.seq_to_id.get(best_match_seq)
+                if fused_id is not None and len(self.bpe_index.get(fused_id, ())) > 0:
+                    length = len(best_match_seq)
+                    original_token_start_idx = random.choice(self.bpe_index[fused_id])
+                    start_sample = int(original_token_start_idx * self.samples_per_token)
+                    end_sample = int((original_token_start_idx + length) * self.samples_per_token)
+                    audio_chunk = self.wav[:, start_sample:end_sample].clone()
+                else:
+                    audio_chunk = torch.zeros(
+                        self.wav.shape[0], max(1, int(query_len * self.samples_per_token)),
+                        dtype=self.wav.dtype)
+
                 # Advance by the length of the query, not the matched chunk, to avoid skipping too much
                 i += query_len
                 pbar.update(query_len)

@@ -13,52 +13,26 @@ import traceback
 import yaml
 
 from redis_utils import serialize_tensor_to_redis
+from sampler_utils import t5_decode, trim_at_eos
 
 # --- All Model Inference and Generation Logic ---
 
 def _t5_decoder_engine(model, encoder_input_ids, max_new, temp, top_k, model_config):
-    # (This function is identical to the one you provided and is correct)
+    """the decode loop, delegated to sampler_utils.t5_decode.
+
+    this was the fifth verbatim copy of that loop in the repo, carrying the same two
+    defects as the rest: a bare idx_next.squeeze(), which collapses to 0-d at batch_size 1,
+    and a `has_finished.all()` host read on EVERY token -- a full device drain per generated
+    token inside a service that is supposed to be serving.
+    """
     pad_id = model_config['pad_token_id']
     eos_id = model_config['eos_token_id']
     mask_id = model_config['mask_token_start_id']
-    batch_size = encoder_input_ids.shape[0]
-    device = encoder_input_ids.device
-    
-    encoder_padding_mask = (encoder_input_ids != pad_id)
-    with torch.no_grad():
-        encoder_hidden_states = model.encode(encoder_input_ids, encoder_padding_mask)
-    
-    decoder_input_ids = torch.full((batch_size, 1), mask_id, dtype=torch.long, device=device)
-    has_finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-    for _ in range(max_new):
-        with torch.no_grad():
-            logits = model.decode_step(decoder_input_ids, encoder_hidden_states, encoder_padding_mask)
-        logits = logits[:, -1, :] / temp
-        
-        if top_k is not None:
-            k = min(top_k, logits.size(-1))
-            v, _ = torch.topk(logits, k)
-            logits[logits < v[:, [-1]]] = -float('Inf')
-            
-        probs = nn.functional.softmax(logits, dim=-1)
-        idx_next = torch.multinomial(probs, num_samples=1)
-        
-        idx_next[has_finished] = pad_id
-        has_finished |= (idx_next.squeeze() == eos_id)
-        decoder_input_ids = torch.cat((decoder_input_ids, idx_next), dim=1)
-        if has_finished.all():
-            break
-            
-    output_sequences = []
-    for i in range(batch_size):
-        seq = decoder_input_ids[i, 1:]
-        eos_idx = (seq == eos_id).nonzero(as_tuple=True)[0]
-        if len(eos_idx) > 0:
-            seq = seq[:eos_idx[0]]
-        output_sequences.append(seq)
-        
-    return output_sequences
+    tape = t5_decode(model, encoder_input_ids, max_new,
+                     pad_id=pad_id, eos_id=eos_id, decoder_start_id=mask_id,
+                     temperature=temp, top_k=top_k)
+    return trim_at_eos(tape, eos_id)
 
 def t5_continue_step(model, context, max_new, temp, top_k, model_config):
     # (This function is identical to the one you provided and is correct)
@@ -178,8 +152,16 @@ def main_service_loop(config):
     t5_cfg = config['t5_service']
     device = t5_cfg['device']
 
+    # decode_responses MUST be False, and this file was the odd one out at True.
+    # encodec_service.py ("We must NOT use decode_responses=True, as it will corrupt the raw
+    # tensor bytes") and local_client.py ("CRITICAL FIX: Do not use decode_responses=True")
+    # both leave it at redis-py's byte-mode default and say why in a comment; only this
+    # service turned it on. it works today purely by luck -- this connection publishes
+    # tensors and only ever READS json job descriptors, and utf-8-decoding json is harmless.
+    # the moment anything here reads a tensor payload back off the queue it silently mangles
+    # it. set explicitly rather than by default, so the next reader sees the decision.
     r = redis.Redis(
-        host=common_cfg['redis_host'], port=common_cfg['redis_port'], decode_responses=True
+        host=common_cfg['redis_host'], port=common_cfg['redis_port'], decode_responses=False
     )
     INPUT_QUEUE = t5_cfg['input_queue']
     OUTPUT_QUEUE = common_cfg['tensor_job_queue']
@@ -195,7 +177,9 @@ def main_service_loop(config):
     while True:
         try:
             _, job_data_str = r.blpop(INPUT_QUEUE)
-            client_job = json.loads(job_data_str)
+            # explicit .decode, matching encodec_service.py, now that this connection is
+            # byte-mode like its siblings.
+            client_job = json.loads(job_data_str.decode('utf-8'))
             
             run_id = datetime.now().strftime('%y%m%d%H%M%S')
             print(f"\n[{run_id}] Received job: {client_job}")
