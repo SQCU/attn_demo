@@ -36,7 +36,16 @@ cuda = [
     "nvidia-cudnn-cu12==9.1.0.70; sys_platform == 'linux' or sys_platform == 'win32'",
     "nvidia-cufft-cu12==11.2.1.3; sys_platform == 'linux' or sys_platform == 'win32'",
     "triton; sys_platform == 'linux'",
-    "triton @ https://github.com/woct0rdho/triton-windows/releases/download/v3.1.0-windows.post8/triton-3.1.0-cp310-cp310-win_amd64.whl; sys_platform == 'win32'",
+    # the win32 triton pin that used to live here was a cp310-only wheel URL from the
+    # WSL era. requires-python is >=3.10, so any resolution targeting win32 + py3.11/3.12
+    # failed outright -- which meant `uv lock` could not be run AT ALL, and adding any
+    # dependency (matplotlib, for the figures) was blocked by a pin unrelated to it.
+    # removed rather than marker-guarded: nothing is developed on win32 any more.
+]
+
+# plotting is not needed to train or sample. `uv sync --extra viz` if you want figures.
+viz = [
+    "matplotlib>=3.8",
 ]
 
 [[tool.uv.index]]

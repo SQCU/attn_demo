@@ -9,3 +9,7 @@ tencache/**
 *.pt
 # oops i packaged the peek log. never again.
 peek_log.txt
+
+# uv resolves this from pyproject.toml; it was 320K of churn in every diff and its
+# stale cp310 win32 triton pin blocked `uv lock` outright. regenerate with `uv sync`.
+uv.lock
